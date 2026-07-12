@@ -16,7 +16,7 @@ local LrColor = import "LrColor"
 local logger = LrLogger('LrLlama')
 logger:enable("logfile") -- Logs to ~/Documents/LrClassicLogs | tail -f LrLlama.log
 
-local model = "gemma3:12b"
+local model = "gemma4:latest"
 
 logger:info("Initializing Lightroom Llama Plugin")
 

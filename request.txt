@@ -1,5 +1,5 @@
 curl http://localhost:11434/api/generate -d '{
-  "model": "minicpm-v",
+  "model": "gemma4:latest",
   "prompt": "Why is the sky blue?",
   "images": ["image"],
   "stream": false,
