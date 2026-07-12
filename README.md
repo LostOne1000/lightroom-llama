@@ -47,7 +47,7 @@ For latest instructions on how to install and run Ollama, see [here](https://git
 
 ## TODO
 
-- [ ] Add support for more LLM models
+- [x] Add support for more LLM models
 - [ ] Add support for remote LLM models via server address entry
 - [ ] Implement batch processing for multiple photos
 - [ ] Add customizable prompt templates
