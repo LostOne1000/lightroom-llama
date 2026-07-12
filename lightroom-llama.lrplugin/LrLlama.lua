@@ -65,21 +65,45 @@ end
 
 local function fetchAvailableModels()
     logger:info("Fetching available models from Ollama")
+
     local url = "http://localhost:11434/api/tags"
     local response = LrHttp.get(url)
+
     if response then
-        local data = JSON:decode(response)
-        if data and data.models then
+        local decodeSuccess, data = pcall(function()
+            return JSON:decode(response)
+        end)
+
+        if decodeSuccess and data and type(data.models) == "table" then
             local modelList = {}
-            for _, m in ipairs(data.models) do
-                table.insert(modelList, m.name or m.model)
+
+            for _, availableModel in ipairs(data.models) do
+                local modelName = availableModel.name or availableModel.model
+
+                if modelName and modelName ~= "" then
+                    table.insert(modelList, modelName)
+                end
             end
-            logger:info("Found " .. #modelList .. " models")
-            return modelList
+
+            if #modelList > 0 then
+                logger:info("Found " .. #modelList .. " models")
+                return modelList
+            end
+
+            logger:warn("Ollama returned an empty model list")
+        elseif not decodeSuccess then
+            logger:warn(
+                "Failed to decode Ollama model response: " .. tostring(data)
+            )
+        else
+            logger:warn("Ollama response did not contain a valid model list")
         end
+    else
+        logger:warn("No response received from Ollama")
     end
-    logger:warn("Failed to fetch model list from Ollama, using default")
-    return { model }  -- fallback to hardcoded default
+
+    logger:warn("Using default model: " .. model)
+    return { model }
 end
 
 
@@ -179,9 +203,9 @@ or
         -- Some models wrap JSON in markdown code fences; strip them before parsing
         local rawResponse = response_data.response
         rawResponse = string.gsub(rawResponse, "^%s*```%w+\n?", "")   -- remove opening ```json
-        rawResponse = string.gsub(rawResponse, "\n?```\s*$", "")     -- remove closing ```
+        rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")     -- remove closing ```
         rawResponse = string.gsub(rawResponse, "^%s*```%s*\n?", "")  -- remove bare opening ```
-        rawResponse = string.gsub(rawResponse, "\n?```\s*$", "")     -- remove bare closing ```
+        rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")     -- remove bare closing ```
 
         local response_json = JSON:decode(rawResponse)
         return response_json
