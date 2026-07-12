@@ -63,21 +63,41 @@ local function base64EncodeImage(imagePath)
     return base64Data
 end
 
+local function fetchAvailableModels()
+    logger:info("Fetching available models from Ollama")
+    local url = "http://localhost:11434/api/tags"
+    local response = LrHttp.get(url)
+    if response then
+        local data = JSON:decode(response)
+        if data and data.models then
+            local modelList = {}
+            for _, m in ipairs(data.models) do
+                table.insert(modelList, m.name or m.model)
+            end
+            logger:info("Found " .. #modelList .. " models")
+            return modelList
+        end
+    end
+    logger:warn("Failed to fetch model list from Ollama, using default")
+    return { model }  -- fallback to hardcoded default
+end
+
 
 ---@param photo LrPhoto The photo to send to the API
 ---@param prompt string The prompt to send to the API
 ---@param currentData table (optional) The current title, caption, and keywords of the photo
 ---@param useCurrentData boolean (optional) Whether to use the current title and caption
 ---@param useSystemPrompt boolean (optional) Whether to use the system prompt
+---@param selectedModel string (optional) The model name to use; falls back to default
 ---@return table response The response from the API
-local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSystemPrompt)
+local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSystemPrompt, selectedModel)
     logger:info("Sending data to API")
     local encodedImage = base64EncodeImage(exportThumbnail(photo))
     local url = "http://localhost:11434/api/generate"
 
     -- Define data to be sent (as a Lua table)
     local postData = {
-        model = model,
+        model = selectedModel or model,
         prompt =  (useCurrentData and "Title: "..currentData.title .. " Caption: "..currentData.caption .. prompt) or prompt,
         format = "json",
         system = useSystemPrompt and [[You are an AI tasked with creating a JSON object containing a `title`, a `caption`, and a list of `keywords` based on a given piece of content (such as an image or video). ]] ..
@@ -155,7 +175,15 @@ or
 
     if response then
         local response_data = JSON:decode(response)
-        local response_json = JSON:decode(response_data.response)
+
+        -- Some models wrap JSON in markdown code fences; strip them before parsing
+        local rawResponse = response_data.response
+        rawResponse = string.gsub(rawResponse, "^%s*```%w+\n?", "")   -- remove opening ```json
+        rawResponse = string.gsub(rawResponse, "\n?```\s*$", "")     -- remove closing ```
+        rawResponse = string.gsub(rawResponse, "^%s*```%s*\n?", "")  -- remove bare opening ```
+        rawResponse = string.gsub(rawResponse, "\n?```\s*$", "")     -- remove bare closing ```
+
+        local response_json = JSON:decode(rawResponse)
         return response_json
     else
         LrDialogs.message("Error", "Failed to send data to the API.", "critical")
@@ -223,6 +251,14 @@ local function main()
         props.response = ""
         props.useCurrentData = props.title ~= "" or props.caption ~= ""
         props.useSystemPrompt = true
+
+        -- Fetch available models from Ollama and populate the dropdown
+        local availableModels = fetchAvailableModels()
+        props.modelItems = {}
+        for _, m in ipairs(availableModels) do
+            table.insert(props.modelItems, { title = m, value = m })
+        end
+        props.selectedModel = availableModels[1]  -- default to first available model
 
         -- Create a view factory
         local f = LrView.osFactory()
@@ -315,8 +351,20 @@ local function main()
                 f:spacer{
                     height = 10
                 },
+                f:static_text{
+                    title = "Model:",
+                    alignment = 'left'
+                },
+                f:spacer{f:label_spacing{}},
+                f:popup_menu{
+                    value = LrView.bind("selectedModel"),
+                    items = props.modelItems,
+                    width = 250,
+                },
+                f:spacer{
+                    height = 10
+                },
                 f:row{f:static_text{
-                    title = "Model: " .. model,
                     fill_horizontal = 1
                 }, f:static_text{
                     alignment = 'right',
@@ -339,8 +387,8 @@ local function main()
                                 title = props.title,
                                 caption = props.caption,
 
-                            },props.useCurrentData,
-                        props.useSystemPrompt)
+                            }, props.useCurrentData,
+                        props.useSystemPrompt, props.selectedModel)
                             props.response = apiResponse
                             props.title = apiResponse.title
                             props.caption = apiResponse.caption
