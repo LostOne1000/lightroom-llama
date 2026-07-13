@@ -6,31 +6,14 @@ local LrFunctionContext = import "LrFunctionContext"
 local LrBinding = import "LrBinding"
 local LrColor = import "LrColor"
 local LrPrefs = import "LrPrefs"
-local LrLogger = import 'LrLogger'
+local LrPathUtils = import 'LrPathUtils'
 
-local logger = LrLogger('ResetMetadata')
-logger:enable("logfile")
+-- Load shared utilities
+local Common = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Common.lua"))))()
 
-logger:info("Initializing Reset Metadata Plugin")
-
-local function removeLlmKeywords(catalog, photo)
-    local allKeywords = photo:getRawMetadata("keywords")
-    if not allKeywords then
-        return
-    end
-
-    local keywordsToRemove = {}
-    for _, keyword in ipairs(allKeywords) do
-        local parent = keyword:getParent()
-        if parent and parent:getName() == "llm" then
-            table.insert(keywordsToRemove, keyword)
-        end
-    end
-
-    for _, keyword in ipairs(keywordsToRemove) do
-        photo:removeKeyword(keyword)
-    end
-end
+--------------------------------------------------------------------------------
+-- Reset dialog + processing
+--------------------------------------------------------------------------------
 
 local function showResetDialog(selectedPhotos)
     local settings = nil
@@ -148,7 +131,7 @@ local function showResetDialog(selectedPhotos)
                     photo:setRawMetadata("caption", "")
                 end
                 if settings.resetKeywords then
-                    removeLlmKeywords(catalog, photo)
+                    Common.removeLlmKeywords(catalog, photo)
                 end
             end
         end)
@@ -159,7 +142,10 @@ local function showResetDialog(selectedPhotos)
     end
 end
 
--- Main reset function (EXACT pattern from BatchLrLlama.lua)
+--------------------------------------------------------------------------------
+-- Main entry point
+--------------------------------------------------------------------------------
+
 local function main()
     local catalog = LrApplication.activeCatalog()
     local selectedPhotos = catalog:getTargetPhotos()
