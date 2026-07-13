@@ -296,7 +296,9 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
             return JSON:decode(response)
         end)
 
-        if not decodeOk1 or not response_data or not response_data.response then
+        if not decodeOk1
+            or type(response_data) ~= "table"
+            or type(response_data.response) ~= "string" then
             logger:warn("Invalid API response structure: " .. tostring(response_data))
             return nil, "Invalid API response structure"
         end
@@ -325,6 +327,14 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
            type(response_json.keywords) ~= "table" then
             logger:warn("API response missing required fields (title, caption, keywords)")
             return nil, "API response missing required fields (title, caption, keywords)"
+        end
+
+        -- Validate each keyword entry is a non-empty string
+        for _, kw in ipairs(response_json.keywords) do
+            if type(kw) ~= "string" or kw:match("^%s*$") then
+                logger:warn("API response contains an invalid keyword entry")
+                return nil, "API response contains an invalid keyword"
+            end
         end
 
         return response_json, nil
