@@ -16,6 +16,7 @@
 ## Key Features
 
 - Generate metadata for your photos with ollama, directly in Lightroom
+- Pulls list of installed models from Ollama, allowing user to switch between them
 - Great for generating titles and captions for your stock photos
 - Local generation, no internet required and your photos aren't uploaded anywhere
 
@@ -34,20 +35,20 @@
 
 - Adobe Lightroom Classic
 - [Ollama](https://ollama.ai/) installed and running on your computer
-- An LLM model downloaded in Ollama (e.g., Llama 2)
+- An LLM model downloaded in Ollama (e.g., minicpm-v, gemma4, etc)
 
 ### Ollama setup
 1. Open a terminal
 2. Install [Homebrew](https://brew.sh/) if you don't have it already
    1. `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
 3. `brew install ollama`
-4. `ollama run minicpm-v`
+4. `ollama run minicpm-v` (Supports localhost only currently).
 
 For latest instructions on how to install and run Ollama, see [here](https://github.com/ollama/ollama).
 
 ## TODO
 
-- [x] Add support for more LLM models
+- [x] Add support for more LLM models - queries Ollama to populate a list of models.
 - [ ] Add support for remote LLM models via server address entry
 - [ ] Implement batch processing for multiple photos
 - [ ] Add customizable prompt templates
