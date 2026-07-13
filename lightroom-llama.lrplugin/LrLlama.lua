@@ -14,9 +14,6 @@ local Common = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Common.lua"))))
 local originalSystemPrompt = [[You are an AI tasked with creating a JSON object containing a `title`, a `caption`, and a list of `keywords` based on a given piece of content (such as an image or video). ]] ..
 [[The content currently has the following metadata which you need to implement and improve upon. It is important to keep the title and caption as close to this as possible.
 
-Current title: "%s"
-Current caption: "%s"
-
 Please follow these detailed guidelines for creating excellent metadata:
 
 1. **Title (Description):**

@@ -291,7 +291,16 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
     LrFileUtils.delete(thumbnailPath)
 
     if response then
-        local response_data = JSON:decode(response)
+        -- Decode outer Ollama API response
+        local decodeOk1, response_data = pcall(function()
+            return JSON:decode(response)
+        end)
+
+        if not decodeOk1 or not response_data or not response_data.response then
+            logger:warn("Invalid API response structure: " .. tostring(response_data))
+            return nil, "Invalid API response structure"
+        end
+
         local rawResponse = response_data.response
 
         -- Strip markdown code fences (many Ollama models wrap JSON in ```json ... ```)
@@ -300,7 +309,24 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         rawResponse = string.gsub(rawResponse, "^%s*```%s*\n?", "")
         rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")
 
-        local response_json = JSON:decode(rawResponse)
+        -- Decode the model-generated JSON
+        local decodeOk2, response_json = pcall(function()
+            return JSON:decode(rawResponse)
+        end)
+
+        if not decodeOk2 or type(response_json) ~= "table" then
+            logger:warn("Invalid JSON in API response: " .. tostring(response_json))
+            return nil, "Invalid JSON in API response"
+        end
+
+        -- Validate required fields exist with correct types
+        if type(response_json.title) ~= "string" or
+           type(response_json.caption) ~= "string" or
+           type(response_json.keywords) ~= "table" then
+            logger:warn("API response missing required fields (title, caption, keywords)")
+            return nil, "API response missing required fields (title, caption, keywords)"
+        end
+
         return response_json, nil
     else
         return nil, "Failed to send data to the API"

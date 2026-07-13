@@ -287,13 +287,16 @@ local function main()
     if #selectedPhotos == 1 then
         local result = LrDialogs.confirm("Single photo selected",
             "You have selected only one photo. Would you like to use the regular Lightroom Llama dialog instead?",
-            "Use Regular Dialog", "Continue with Batch", "Cancel")
+            "Continue with Batch", "Use Regular Dialog", "Cancel")
 
         if result == "ok" then
-            -- Could call the regular dialog here, but for now just return
+            -- Continue with batch processing, fall through to showBatchDialog below
+        elseif result == "cancel" then
+            -- User chose regular dialog
             LrDialogs.message("Suggestion", "Please use the 'Lightroom Llama...' menu item for single photos.", "info")
             return
-        elseif result == "cancel" then
+        else
+            -- Cancel button ("other"), do nothing
             return
         end
     end
