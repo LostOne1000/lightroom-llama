@@ -224,7 +224,15 @@ Before finalizing, ensure:
 
     if response then
         local response_data = JSON:decode(response)
-        local response_json = JSON:decode(response_data.response)
+        local rawResponse = response_data.response
+
+        -- Strip markdown code fences (many Ollama models wrap JSON in ```json ... ```)
+        rawResponse = string.gsub(rawResponse, "^%s*```%w+\n?", "")
+        rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")
+        rawResponse = string.gsub(rawResponse, "^%s*```%s*\n?", "")
+        rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")
+
+        local response_json = JSON:decode(rawResponse)
         return response_json, nil
     else
         return nil, "Failed to send data to the API"
