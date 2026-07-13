@@ -211,7 +211,7 @@ local function showBatchDialog(selectedPhotos)
         local result = LrDialogs.presentModalDialog({
             title = "Batch Process with Llama",
             contents = c,
-            actionVerb = "Cancel"
+            actionVerb = "Done"
         })
 
         -- Only process if Start Processing was clicked (not Cancel/ESC)
