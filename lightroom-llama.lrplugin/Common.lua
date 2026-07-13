@@ -132,27 +132,18 @@ local function saveServerAndRefresh(props, prefs)
         return false, "No models found on server"
     end
 
-    -- Rebuild model list. Because the popup_menu uses LrView.bind("modelItems"),
-    -- reassigning props.modelItems to a new (empty) table will trigger the
-    -- binding to refresh the dropdown items.
+    -- Rebuild model list. This function is intended to be called from inside
+    -- LrTasks.startAsyncTask() so that LrBinding picks up the property
+    -- reassignment and propagates it to the dialog's popup_menu.
     local oldSelection = props.selectedModel or ""
-    local newItems = makeModelItems(availableModels)
-
-    -- First assign an empty table so LrView clears the existing items
-    props.modelItems = {}
-    LrTasks.sleep(0.01)  -- let the binding propagate before the final value
-    props.modelItems = newItems
+    props.modelItems = makeModelItems(availableModels)
 
     -- Keep old selection if it still exists in the new list
     local found = false
     for _, m in ipairs(availableModels) do
         if m == oldSelection then found = true; break; end
     end
-    if not found then
-        props.selectedModel = availableModels[1]
-    else
-        props.selectedModel = oldSelection
-    end
+    props.selectedModel = found and oldSelection or availableModels[1]
 
     return true, string.format("Loaded %d model(s)", #availableModels)
 end

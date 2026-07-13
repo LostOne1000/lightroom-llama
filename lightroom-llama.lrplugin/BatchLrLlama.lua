@@ -187,14 +187,20 @@ local function showBatchDialog(selectedPhotos)
                 }, f:push_button{
                     title = "Save Server",
                     action = function()
-                        local ok, msg = Common.saveServerAndRefresh(props, prefs)
-                        if not ok then
-                            props.status = "Error: " .. msg
-                            props.statusColor = LrColor(0.8, 0.2, 0.2)
-                        else
-                            props.status = msg
-                            props.statusColor = LrColor(0.149, 0.616, 0.412)
-                        end
+                        props.status = "Refreshing models..."
+                        props.statusColor = LrColor(0.439, 0.345, 0.745)
+
+                        LrTasks.startAsyncTask(function()
+                            local ok, msg = Common.saveServerAndRefresh(props, prefs)
+
+                            if not ok then
+                                props.status = "Error: " .. msg
+                                props.statusColor = LrColor(0.8, 0.2, 0.2)
+                            else
+                                props.status = msg
+                                props.statusColor = LrColor(0.149, 0.616, 0.412)
+                            end
+                        end)
                     end
                 }},
             }
