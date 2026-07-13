@@ -178,13 +178,6 @@ local function showBatchDialog(selectedPhotos)
                 f:separator{width = 400},
                 f:spacer{height = 10},
                 f:row{f:push_button{
-                    title = "Start Processing",
-                    action = function()
-                        shouldProcess = true
-                    end
-                }, f:spacer{
-                    width = 10
-                }, f:push_button{
                     title = "Save Server",
                     action = function()
                         props.status = "Refreshing models..."
@@ -206,16 +199,14 @@ local function showBatchDialog(selectedPhotos)
             }
         }
 
-        local shouldProcess = false
-
         local result = LrDialogs.presentModalDialog({
             title = "Batch Process with Llama",
             contents = c,
-            actionVerb = "Done"
+            actionVerb = "Start Processing"
         })
 
         -- Only process if Start Processing was clicked (not Cancel/ESC)
-        if shouldProcess then
+        if result == "ok" then
             -- Save preferences for next time
             prefs.batchPrompt = props.prompt
             prefs.batchUseCurrentData = props.useCurrentData
