@@ -17,11 +17,54 @@ local LrPrefs = import "LrPrefs"
 local logger = LrLogger('BatchLrLlama')
 logger:enable("logfile")
 
-local model = "minicpm-v"
+local model = "gemma4:latest"
 
 logger:info("Initializing Lightroom Llama Batch Processing Plugin")
 
 JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
+
+local function fetchAvailableModels()
+    logger:info("Fetching available models from Ollama")
+
+    local url = "http://localhost:11434/api/tags"
+    local response = LrHttp.get(url)
+
+    if response then
+        local decodeSuccess, data = pcall(function()
+            return JSON:decode(response)
+        end)
+
+        if decodeSuccess and data and type(data.models) == "table" then
+            local modelList = {}
+
+            for _, availableModel in ipairs(data.models) do
+                local modelName = availableModel.name or availableModel.model
+
+                if modelName and modelName ~= "" then
+                    table.insert(modelList, modelName)
+                end
+            end
+
+            if #modelList > 0 then
+                logger:info("Found " .. #modelList .. " models")
+                return modelList
+            end
+
+            logger:warn("Ollama returned an empty model list")
+        elseif not decodeSuccess then
+            logger:warn(
+                "Failed to decode Ollama model response: " .. tostring(data)
+            )
+        else
+            logger:warn("Ollama response did not contain a valid model list")
+        end
+    else
+        logger:warn("No response received from Ollama")
+    end
+
+    logger:warn("Using default model: " .. model)
+    return { model }
+end
 
 -- Shared functions (duplicated from LrLlama.lua for now)
 local function exportThumbnail(photo)
@@ -103,7 +146,7 @@ local function base64EncodeImage(imagePath)
     return base64Data
 end
 
-local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSystemPrompt)
+local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSystemPrompt, selectedModel)
     logger:info("Sending data to API for batch processing")
 
     -- Try to export thumbnail with retry
@@ -129,7 +172,7 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
     local url = "http://localhost:11434/api/generate"
 
     local postData = {
-        model = model,
+        model = selectedModel or model,
         prompt = (useCurrentData and "Title: "..(currentData.title or ""):gsub('"', '\\"') .. " Caption: "..(currentData.caption or ""):gsub('"', '\\"') .. " " .. prompt) or prompt,
         format = "json",
         system = useSystemPrompt and [[# Image Metadata Generation Prompt
@@ -309,7 +352,7 @@ local function processPhotosApiOnly(photos, settings)
         }
 
         -- Process photo with API
-        local apiResponse, apiError = sendDataToApi(photo, settings.prompt, currentData, settings.useCurrentData, settings.useSystemPrompt)
+        local apiResponse, apiError = sendDataToApi(photo, settings.prompt, currentData, settings.useCurrentData, settings.useSystemPrompt, settings.selectedModel)
 
         if apiResponse then
             result.success = true
@@ -317,11 +360,6 @@ local function processPhotosApiOnly(photos, settings)
         else
             result.error = apiError or "Unknown API error"
         end
-
-        table.insert(results, result)
-
-        -- Small delay between photos
-        LrTasks.sleep(0.5)
     end
 
     return results
@@ -408,6 +446,14 @@ local function showBatchDialog(selectedPhotos)
         props.generateCaption = prefs.batchGenerateCaption ~= false -- Default to true
         props.generateKeywords = prefs.batchGenerateKeywords ~= false -- Default to true
 
+        -- Fetch available models from Ollama and populate the dropdown
+        local availableModels = fetchAvailableModels()
+        props.modelItems = {}
+        for _, m in ipairs(availableModels) do
+            table.insert(props.modelItems, { title = m, value = m })
+        end
+        props.selectedModel = prefs.batchSelectedModel or availableModels[1]  -- restore preference or default to first
+
         local f = LrView.osFactory()
 
         local c = f:view{
@@ -476,8 +522,14 @@ local function showBatchDialog(selectedPhotos)
                 f:spacer{height = 10},
 
                 f:static_text{
-                    title = "Model: " .. model,
-                    font = "<system>"
+                    title = "Model:",
+                    alignment = 'left'
+                },
+                f:spacer{f:label_spacing{}},
+                f:popup_menu{
+                    value = LrView.bind("selectedModel"),
+                    items = props.modelItems,
+                    width = 250,
                 },
                 f:spacer{height = 10},
 
@@ -504,6 +556,7 @@ local function showBatchDialog(selectedPhotos)
             prefs.batchGenerateTitle = props.generateTitle
             prefs.batchGenerateCaption = props.generateCaption
             prefs.batchGenerateKeywords = props.generateKeywords
+            prefs.batchSelectedModel = props.selectedModel
 
             local settings = {
                 prompt = props.prompt,
@@ -512,7 +565,8 @@ local function showBatchDialog(selectedPhotos)
                 skipExisting = props.skipExisting,
                 generateTitle = props.generateTitle,
                 generateCaption = props.generateCaption,
-                generateKeywords = props.generateKeywords
+                generateKeywords = props.generateKeywords,
+                selectedModel = props.selectedModel
             }
 
             -- Process with progress scope
@@ -561,7 +615,7 @@ local function showBatchDialog(selectedPhotos)
                         }
 
                         -- Process photo with API
-                        local apiResponse, apiError = sendDataToApi(photo, settings.prompt, currentData, settings.useCurrentData, settings.useSystemPrompt)
+                        local apiResponse, apiError = sendDataToApi(photo, settings.prompt, currentData, settings.useCurrentData, settings.useSystemPrompt, settings.selectedModel)
 
                         if apiResponse then
                             result.success = true
@@ -570,9 +624,6 @@ local function showBatchDialog(selectedPhotos)
                             result.error = apiError or "Unknown API error"
                         end
                     end
-
-                    table.insert(results, result)
-                    progressScope:setPortionComplete(i, #selectedPhotos)
                 end
 
                 progressScope:done()
