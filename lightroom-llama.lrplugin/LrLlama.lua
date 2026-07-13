@@ -1,135 +1,20 @@
--- TODO Add keywords
-local LrHttp = import 'LrHttp'
-local LrPathUtils = import 'LrPathUtils'
-local LrLogger = import 'LrLogger'
 local LrApplication = import "LrApplication"
-local LrErrors = import "LrErrors"
 local LrDialogs = import "LrDialogs"
 local LrView = import "LrView"
 local LrTasks = import "LrTasks"
 local LrFunctionContext = import "LrFunctionContext"
-local LrFileUtils = import 'LrFileUtils'
-local LrStringUtils = import 'LrStringUtils'
 local LrBinding = import "LrBinding"
 local LrColor = import "LrColor"
+local LrPathUtils = import 'LrPathUtils'
 
-local logger = LrLogger('LrLlama')
-logger:enable("logfile") -- Logs to ~/Documents/LrClassicLogs | tail -f LrLlama.log
+-- Load shared utilities (includes logger, model constant, JSON loader, shared functions)
+local Common = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Common.lua"))))()
 
-local model = "gemma4:latest"
+-- The original system prompt from LrLlama.lua (preserved for single-image use)
+local originalSystemPrompt = [[You are an AI tasked with creating a JSON object containing a `title`, a `caption`, and a list of `keywords` based on a given piece of content (such as an image or video). ]] ..
+[[The content currently has the following metadata which you need to implement and improve upon. It is important to keep the title and caption as close to this as possible.
 
-logger:info("Initializing Lightroom Llama Plugin")
-
-JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
-
-local function exportThumbnail(photo)
-    local tempPath = LrFileUtils.chooseUniqueFileName(LrPathUtils.getStandardFilePath('temp') .. "/thumbnail.jpg")
-
-    local success, result = photo:requestJpegThumbnail(512, 512, function(jpegData)
-        -- Save the JPEG thumbnail to the temporary file
-        if jpegData then
-            local tempFile = io.open(tempPath, "wb")
-            tempFile:write(jpegData)
-            tempFile:close()
-            logger:info("Thumbnail saved to " .. tempPath)
-            return true
-        end
-        return false
-    end)
-
-    if success then
-        return tempPath
-    else
-        logger:warn("Failed to export thumbnail")
-        return nil
-    end
-end
-
-local function base64EncodeImage(imagePath)
-
-    -- Read the image file as binary
-    local file = io.open(imagePath, "rb") -- Open the file in binary mode
-    if not file then
-        LrDialogs.message("Error", "Could not open file: " .. imagePath, "critical")
-        return
-    end
-
-    local binaryData = file:read("*all") -- Read the entire file as binary data
-    file:close() -- Close the file
-
-    -- Encode the binary data to Base64
-    local base64Data = LrStringUtils.encodeBase64(binaryData)
-
-    return base64Data
-end
-
-local function fetchAvailableModels()
-    logger:info("Fetching available models from Ollama")
-
-    local url = "http://localhost:11434/api/tags"
-    local response = LrHttp.get(url)
-
-    if response then
-        local decodeSuccess, data = pcall(function()
-            return JSON:decode(response)
-        end)
-
-        if decodeSuccess and data and type(data.models) == "table" then
-            local modelList = {}
-
-            for _, availableModel in ipairs(data.models) do
-                local modelName = availableModel.name or availableModel.model
-
-                if modelName and modelName ~= "" then
-                    table.insert(modelList, modelName)
-                end
-            end
-
-            if #modelList > 0 then
-                logger:info("Found " .. #modelList .. " models")
-                return modelList
-            end
-
-            logger:warn("Ollama returned an empty model list")
-        elseif not decodeSuccess then
-            logger:warn(
-                "Failed to decode Ollama model response: " .. tostring(data)
-            )
-        else
-            logger:warn("Ollama response did not contain a valid model list")
-        end
-    else
-        logger:warn("No response received from Ollama")
-    end
-
-    logger:warn("Using default model: " .. model)
-    return { model }
-end
-
-
----@param photo LrPhoto The photo to send to the API
----@param prompt string The prompt to send to the API
----@param currentData table (optional) The current title, caption, and keywords of the photo
----@param useCurrentData boolean (optional) Whether to use the current title and caption
----@param useSystemPrompt boolean (optional) Whether to use the system prompt
----@param selectedModel string (optional) The model name to use; falls back to default
----@return table response The response from the API
-local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSystemPrompt, selectedModel)
-    logger:info("Sending data to API")
-    local encodedImage = base64EncodeImage(exportThumbnail(photo))
-    local url = "http://localhost:11434/api/generate"
-
-    -- Define data to be sent (as a Lua table)
-    local postData = {
-        model = selectedModel or model,
-        prompt =  (useCurrentData and "Title: "..currentData.title .. " Caption: "..currentData.caption .. prompt) or prompt,
-        format = "json",
-        system = useSystemPrompt and [[You are an AI tasked with creating a JSON object containing a `title`, a `caption`, and a list of `keywords` based on a given piece of content (such as an image or video). ]] ..
-        (useCurrentData and [[The content currently has the following metadata which you need to implement and improve upon. It is important to keep the title and caption as close to this as possible.
-Current title: "]] .. (currentData.title or "") .. [["
-Current caption: "]] .. (currentData.caption or "") .. [["
-
-]] or "") .. [[Please follow these detailed guidelines for creating excellent metadata:
+Please follow these detailed guidelines for creating excellent metadata:
 
 1. **Title (Description):**
    - Provide a unique, descriptive title for the content.
@@ -170,82 +55,6 @@ Current caption: "]] .. (currentData.caption or "") .. [["
 ```
 
 Use this structure and guidelines to generate titles, captions, and keywords that are descriptive, unique, and accurate.]]
-or
-[[You are an AI tasked with creating a JSON object containing a `title`, a `caption`, and a list of `keywords` based on a given piece of content (such as an image or video).
-
-### JSON Format:
-```json
-{
-  "title": "string",
-  "caption": "string",
-  "keywords": ["string"]
-}
-```
-]],
-        images = {encodedImage},
-        stream = false
-    }
-
-    logger:info("Post data: " .. JSON:encode(postData))
-
-    -- Convert the Lua table to a JSON string
-    local jsonPayload = JSON:encode(postData)
-
-    -- Make a POST request
-    local response, headers = LrHttp.post(url, jsonPayload, {{
-        field = "Content-Type",
-        value = "application/json"
-    }})
-
-    if response then
-        local response_data = JSON:decode(response)
-
-        -- Some models wrap JSON in markdown code fences; strip them before parsing
-        local rawResponse = response_data.response
-        rawResponse = string.gsub(rawResponse, "^%s*```%w+\n?", "")   -- remove opening ```json
-        rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")     -- remove closing ```
-        rawResponse = string.gsub(rawResponse, "^%s*```%s*\n?", "")  -- remove bare opening ```
-        rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")     -- remove bare closing ```
-
-        local response_json = JSON:decode(rawResponse)
-        return response_json
-    else
-        LrDialogs.message("Error", "Failed to send data to the API.", "critical")
-        return "Error: Failed to send data to the API."
-    end
-end
-
-local function addKeywordsWithParent(catalog, photo, keywords)
-    if keywords and type(keywords) == "table" then
-        -- First create or get the parent 'llm' keyword
-        local llmKeyword = catalog:createKeyword("llm", nil, true, nil, true)
-
-        for _, keyword in ipairs(keywords) do
-            if keyword and keyword ~= "" then
-                -- Create child keyword under 'llm' parent
-                local childKeyword = catalog:createKeyword(keyword, nil, true, llmKeyword, true)
-                -- Add the keyword object to the photo
-                photo:addKeyword(childKeyword)
-            end
-        end
-    end
-end
-
-local function getLlmKeywordsFromPhoto(photo)
-    local llmKeywords = {}
-    local allKeywords = photo:getRawMetadata("keywords")
-
-    if allKeywords then
-        for _, keyword in ipairs(allKeywords) do
-            local parent = keyword:getParent()
-            if parent and parent:getName() == "llm" then
-                table.insert(llmKeywords, keyword:getName())
-            end
-        end
-    end
-
-    return llmKeywords
-end
 
 local function main()
     -- Get the active catalog
@@ -260,7 +69,7 @@ local function main()
 
     -- Get the first selected photo (if multiple, you can modify the code for more)
     local selectedPhoto = selectedPhotos[1]
-    local thumbnailPath = exportThumbnail(selectedPhoto)
+    local thumbnailPath = Common.exportThumbnail(selectedPhoto)
 
     LrFunctionContext.callWithContext("showLlamaDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
@@ -270,14 +79,14 @@ local function main()
         props.title = selectedPhoto:getFormattedMetadata('title')
         props.caption = selectedPhoto:getFormattedMetadata('caption')
         -- Initialize keywords with existing llm keywords
-        local existingLlmKeywords = getLlmKeywordsFromPhoto(selectedPhoto)
+        local existingLlmKeywords = Common.getLlmKeywordsFromPhoto(selectedPhoto)
         props.keywords = table.concat(existingLlmKeywords, ", ")
         props.response = ""
         props.useCurrentData = props.title ~= "" or props.caption ~= ""
         props.useSystemPrompt = true
 
         -- Fetch available models from Ollama and populate the dropdown
-        local availableModels = fetchAvailableModels()
+        local availableModels = Common.fetchAvailableModels()
         props.modelItems = {}
         for _, m in ipairs(availableModels) do
             table.insert(props.modelItems, { title = m, value = m })
@@ -407,12 +216,20 @@ local function main()
                         props.statusColor = LrColor(0.439, 0.345, 0.745)
 
                         LrTasks.startAsyncTask(function()
-                            local apiResponse = sendDataToApi(selectedPhoto, props.prompt, {
-                                title = props.title,
-                                caption = props.caption,
-
-                            }, props.useCurrentData,
-                        props.useSystemPrompt, props.selectedModel)
+                            local apiResponse, apiError = Common.sendDataToApi(
+                                selectedPhoto,
+                                props.prompt,
+                                { title = props.title, caption = props.caption },
+                                props.useCurrentData,
+                                props.useSystemPrompt,
+                                props.selectedModel,
+                                originalSystemPrompt
+                            )
+                            if apiError then
+                                props.status = "Error: " .. apiError
+                                props.statusColor = LrColor(0.8, 0.2, 0.2)
+                                return
+                            end
                             props.response = apiResponse
                             props.title = apiResponse.title
                             props.caption = apiResponse.caption
@@ -453,7 +270,7 @@ local function main()
                     for keyword in string.gmatch(props.keywords, "([^,]+)") do
                         table.insert(keywordList, keyword:match("^%s*(.-)%s*$")) -- trim whitespace
                     end
-                    addKeywordsWithParent(catalog, selectedPhoto, keywordList)
+                    Common.addKeywordsWithParent(catalog, selectedPhoto, keywordList)
                 end
             end)
 
