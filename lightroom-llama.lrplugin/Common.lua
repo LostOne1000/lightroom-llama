@@ -7,11 +7,60 @@ local LrLogger = import 'LrLogger'
 local LrFileUtils = import 'LrFileUtils'
 local LrStringUtils = import 'LrStringUtils'
 local LrTasks = import "LrTasks"
+local LrPrefs = import "LrPrefs"
 
 local logger = LrLogger('LrLlama')
 logger:enable("logfile") -- Logs to ~/Documents/LrClassicLogs | tail -f LrLlama.log
 
 local model = "gemma4:latest"
+
+local defaultServerHost = "localhost:11434"
+
+--------------------------------------------------------------------------------
+-- Validates that a string is in "host:port" form (IP, hostname, or localhost)
+-- Returns (true, normalized_host) or (false, error_message)
+--------------------------------------------------------------------------------
+
+local function validateServerHost(input)
+    if not input or input == "" then
+        return true, defaultServerHost  -- treat empty as "use default"
+    end
+    -- Strip scheme and trailing slashes for normalization
+    local host = string.gsub(input, "^https?://", "")
+    host = string.gsub(host, "/+$", "")
+
+    -- Must match something:digit (hostname or IP followed by colon and port)
+    local hostnamePart, portPart = string.match(host, "^([^:]+):(%d+)$")
+    if not hostnamePart or not portPart then
+        return false, "Server address must be in host:port format (e.g., localhost:11434)"
+    end
+
+    local port = tonumber(portPart)
+    if port < 1 or port > 65535 then
+        return false, "Port number must be between 1 and 65535"
+    end
+
+    -- hostnamePart should contain at least one valid character (alphanumeric, dot, hyphen)
+    if not string.match(hostnamePart, "^[%a%d%.%-]+$") then
+        return false, "Hostname contains invalid characters"
+    end
+
+    return true, hostnamePart .. ":" .. portPart
+end
+
+--------------------------------------------------------------------------------
+-- Constructs the Ollama base URL from stored preferences
+--------------------------------------------------------------------------------
+
+local function getOllamaBaseUrl()
+    local prefs = LrPrefs.prefsForPlugin()
+    local ok, host = validateServerHost(prefs.ollamaServerHost)
+    if not ok then
+        logger:warn("Invalid server host in prefs: " .. tostring(prefs.ollamaServerHost))
+        host = defaultServerHost  -- fall back on bad pref data
+    end
+    return "http://" .. host
+end
 
 JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
 
@@ -19,10 +68,18 @@ JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
 -- Model discovery
 --------------------------------------------------------------------------------
 
+local function makeModelItems(modelNames)
+    local items = {}
+    for _, m in ipairs(modelNames) do
+        table.insert(items, { title = m, value = m })
+    end
+    return items
+end
+
 local function fetchAvailableModels()
     logger:info("Fetching available models from Ollama")
 
-    local url = "http://localhost:11434/api/tags"
+    local url = getOllamaBaseUrl() .. "/api/tags"
     local response = LrHttp.get(url)
 
     if response then
@@ -60,6 +117,44 @@ local function fetchAvailableModels()
 
     logger:warn("Using default model: " .. model)
     return { model }
+end
+
+local function saveServerAndRefresh(props, prefs)
+    local ok, validatedHost = validateServerHost(props.serverHost)
+    if not ok then
+        return false, validatedHost  -- caller displays error
+    end
+
+    prefs.ollamaServerHost = validatedHost
+
+    local availableModels = fetchAvailableModels()
+    if not availableModels or #availableModels == 0 then
+        return false, "No models found on server"
+    end
+
+    -- Rebuild model list. Because the popup_menu uses LrView.bind("modelItems"),
+    -- reassigning props.modelItems to a new (empty) table will trigger the
+    -- binding to refresh the dropdown items.
+    local oldSelection = props.selectedModel or ""
+    local newItems = makeModelItems(availableModels)
+
+    -- First assign an empty table so LrView clears the existing items
+    props.modelItems = {}
+    LrTasks.sleep(0.01)  -- let the binding propagate before the final value
+    props.modelItems = newItems
+
+    -- Keep old selection if it still exists in the new list
+    local found = false
+    for _, m in ipairs(availableModels) do
+        if m == oldSelection then found = true; break; end
+    end
+    if not found then
+        props.selectedModel = availableModels[1]
+    else
+        props.selectedModel = oldSelection
+    end
+
+    return true, string.format("Loaded %d model(s)", #availableModels)
 end
 
 --------------------------------------------------------------------------------
@@ -266,7 +361,7 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
         return nil, "Failed to encode image"
     end
 
-    local url = "http://localhost:11434/api/generate"
+    local url = getOllamaBaseUrl() .. "/api/generate"
 
     -- Choose system prompt: caller-provided > default
     local activeSystemPrompt = systemPrompt or defaultSystemPrompt
@@ -421,7 +516,11 @@ end
 
 return {
     model = model,
+    defaultServerHost = defaultServerHost,
+    validateServerHost = validateServerHost,
+    makeModelItems = makeModelItems,
     fetchAvailableModels = fetchAvailableModels,
+    saveServerAndRefresh = saveServerAndRefresh,
     exportThumbnail = exportThumbnail,
     base64EncodeImage = base64EncodeImage,
     sendDataToApi = sendDataToApi,

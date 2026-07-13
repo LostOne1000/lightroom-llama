@@ -5,6 +5,7 @@ local LrTasks = import "LrTasks"
 local LrFunctionContext = import "LrFunctionContext"
 local LrBinding = import "LrBinding"
 local LrColor = import "LrColor"
+local LrPrefs = import "LrPrefs"
 local LrPathUtils = import 'LrPathUtils'
 
 -- Load shared utilities (includes logger, model constant, JSON loader, shared functions)
@@ -56,6 +57,8 @@ Please follow these detailed guidelines for creating excellent metadata:
 
 Use this structure and guidelines to generate titles, captions, and keywords that are descriptive, unique, and accurate.]]
 
+-- Note: saveServerAndRefresh moved to Common.lua — used by both dialogs
+
 local function main()
     -- Get the active catalog
     local catalog = LrApplication.activeCatalog()
@@ -73,6 +76,7 @@ local function main()
 
     LrFunctionContext.callWithContext("showLlamaDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
+        local prefs = LrPrefs.prefsForPlugin()
         props.status = "Ready"
         props.statusColor = LrColor(0.149, 0.616, 0.412)
         props.prompt = "Caption this photo"
@@ -83,14 +87,12 @@ local function main()
         props.keywords = table.concat(existingLlmKeywords, ", ")
         props.response = ""
         props.useCurrentData = props.title ~= "" or props.caption ~= ""
+        props.serverHost = prefs.ollamaServerHost or Common.defaultServerHost
         props.useSystemPrompt = true
 
         -- Fetch available models from Ollama and populate the dropdown
         local availableModels = Common.fetchAvailableModels()
-        props.modelItems = {}
-        for _, m in ipairs(availableModels) do
-            table.insert(props.modelItems, { title = m, value = m })
-        end
+        props.modelItems = Common.makeModelItems(availableModels)
         props.selectedModel = availableModels[1]  -- default to first available model
 
         -- Create a view factory
@@ -184,6 +186,29 @@ local function main()
                 f:spacer{
                     height = 10
                 },
+                f:separator{
+                    width = 400
+                },
+                f:spacer{
+                    height = 10
+                },
+                f:static_text{
+                    title = "Ollama Server:",
+                    alignment = 'left'
+                },
+                f:spacer{f:label_spacing{}},
+                f:edit_field{
+                    value = LrView.bind("serverHost"),
+                    width = 250,
+                },
+                f:static_text{
+                    title = "(default: localhost:11434)",
+                    alignment = 'left',
+                    text_color = LrColor(0.6, 0.6, 0.6)
+                },
+                f:spacer{
+                    height = 10
+                },
                 f:static_text{
                     title = "Model:",
                     alignment = 'left'
@@ -191,7 +216,7 @@ local function main()
                 f:spacer{f:label_spacing{}},
                 f:popup_menu{
                     value = LrView.bind("selectedModel"),
-                    items = props.modelItems,
+                    items = LrView.bind("modelItems"),
                     width = 250,
                 },
                 f:spacer{
@@ -243,6 +268,20 @@ local function main()
                             props.statusColor = LrColor(0.149, 0.616, 0.412)
                         end)
                     end
+                }, f:spacer{
+                    width = 10
+                }, f:push_button{
+                    title = "Save Server",
+                    action = function()
+                        local ok, msg = Common.saveServerAndRefresh(props, prefs)
+                        if not ok then
+                            props.status = "Error: " .. msg
+                            props.statusColor = LrColor(0.8, 0.2, 0.2)
+                        else
+                            props.status = msg
+                            props.statusColor = LrColor(0.149, 0.616, 0.412)
+                        end
+                    end
                 }},
                 f:spacer{
                     height = 20
@@ -260,6 +299,18 @@ local function main()
 
 
         if result == "ok" then
+            -- Validate and save server host preference
+            local ok, validatedHost = Common.validateServerHost(props.serverHost)
+            if not ok then
+                LrDialogs.message(
+                    "Invalid Server Address",
+                    validatedHost .. "\n\nPlease enter it as host:port (e.g., localhost:11434 or 192.168.1.10:11434).",
+                    "warning"
+                )
+            else
+                prefs.ollamaServerHost = validatedHost
+            end
+
             -- Save the metadata to the photo
             catalog:withWriteAccessDo("Save Llama metadata", function()
                 selectedPhoto:setRawMetadata("title", props.title)

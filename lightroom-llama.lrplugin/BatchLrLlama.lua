@@ -72,13 +72,15 @@ local function showBatchDialog(selectedPhotos)
         props.generateTitle = prefs.batchGenerateTitle ~= false -- Default to true
         props.generateCaption = prefs.batchGenerateCaption ~= false -- Default to true
         props.generateKeywords = prefs.batchGenerateKeywords ~= false -- Default to true
+        props.serverHost = prefs.ollamaServerHost or Common.defaultServerHost
+        props.status = "Ready"
+        props.statusColor = LrColor(0.149, 0.616, 0.412)
+
+        -- Note: saveServerAndRefresh moved to Common.lua
 
         -- Fetch available models from Ollama and populate the dropdown
         local availableModels = Common.fetchAvailableModels()
-        props.modelItems = {}
-        for _, m in ipairs(availableModels) do
-            table.insert(props.modelItems, { title = m, value = m })
-        end
+        props.modelItems = Common.makeModelItems(availableModels)
         props.selectedModel = prefs.batchSelectedModel or availableModels[1]  -- restore preference or default to first
 
         local f = LrView.osFactory()
@@ -134,11 +136,25 @@ local function showBatchDialog(selectedPhotos)
                 f:separator{width = 400},
                 f:spacer{height = 10},
 
+                f:static_text{title = "Ollama Server:", alignment = 'left'},
+                f:spacer{f:label_spacing{}},
+                f:row{
+                    f:edit_field{
+                        value = LrView.bind("serverHost"),
+                        width = 250,
+                    },
+                    f:static_text{
+                        title = "(default: localhost:11434)",
+                        text_color = LrColor(0.6, 0.6, 0.6)
+                    }
+                },
+                f:spacer{height = 10},
+
                 f:static_text{title = "Model:", alignment = 'left'},
                 f:spacer{f:label_spacing{}},
                 f:popup_menu{
                     value = LrView.bind("selectedModel"),
-                    items = props.modelItems,
+                    items = LrView.bind("modelItems"),
                     width = 250,
                 },
                 f:spacer{height = 10},
@@ -147,17 +163,53 @@ local function showBatchDialog(selectedPhotos)
                     title = "Note: This process may take several minutes depending on the number of photos.",
                     font = "<system>",
                     text_color = LrColor(0.6, 0.6, 0.6)
-                }
+                },
+                f:spacer{height = 10},
+                f:row{f:static_text{
+                    fill_horizontal = 1
+                }, f:static_text{
+                    alignment = 'right',
+                    title = LrView.bind("status"),
+                    width = 200,
+                    font = "<system/bold>",
+                    text_color = LrView.bind("statusColor")
+                }},
+                f:spacer{height = 10},
+                f:separator{width = 400},
+                f:spacer{height = 10},
+                f:row{f:push_button{
+                    title = "Start Processing",
+                    action = function()
+                        shouldProcess = true
+                    end
+                }, f:spacer{
+                    width = 10
+                }, f:push_button{
+                    title = "Save Server",
+                    action = function()
+                        local ok, msg = Common.saveServerAndRefresh(props, prefs)
+                        if not ok then
+                            props.status = "Error: " .. msg
+                            props.statusColor = LrColor(0.8, 0.2, 0.2)
+                        else
+                            props.status = msg
+                            props.statusColor = LrColor(0.149, 0.616, 0.412)
+                        end
+                    end
+                }},
             }
         }
+
+        local shouldProcess = false
 
         local result = LrDialogs.presentModalDialog({
             title = "Batch Process with Llama",
             contents = c,
-            actionVerb = "Start Processing"
+            actionVerb = "Cancel"
         })
 
-        if result == "ok" then
+        -- Only process if Start Processing was clicked (not Cancel/ESC)
+        if shouldProcess then
             -- Save preferences for next time
             prefs.batchPrompt = props.prompt
             prefs.batchUseCurrentData = props.useCurrentData
@@ -167,6 +219,18 @@ local function showBatchDialog(selectedPhotos)
             prefs.batchGenerateCaption = props.generateCaption
             prefs.batchGenerateKeywords = props.generateKeywords
             prefs.batchSelectedModel = props.selectedModel
+
+            -- Validate server host before saving
+            local ok, validatedHost = Common.validateServerHost(props.serverHost)
+            if not ok then
+                LrDialogs.message(
+                    "Invalid Server Address",
+                    validatedHost .. "\n\nPlease enter it as host:port (e.g., localhost:11434 or 192.168.1.10:11434).",
+                    "warning"
+                )
+                return  -- abort; keep dialog open so the user can correct it
+            end
+            prefs.ollamaServerHost = validatedHost
 
             local settings = {
                 prompt = props.prompt,
