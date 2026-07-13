@@ -238,6 +238,9 @@ local function showBatchDialog(selectedPhotos)
                             result.error = apiError or "Unknown API error"
                         end
                     end
+
+                    table.insert(results, result)
+                    progressScope:setPortionComplete(i, #selectedPhotos)
                 end
 
                 progressScope:done()
