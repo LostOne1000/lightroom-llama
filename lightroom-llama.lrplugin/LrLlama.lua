@@ -291,10 +291,7 @@ local function main()
                 selectedPhoto:setRawMetadata("caption", props.caption)
                 -- Parse keywords from comma-separated string and add with llm parent
                 if props.keywords and props.keywords ~= "" then
-                    local keywordList = {}
-                    for keyword in string.gmatch(props.keywords, "([^,]+)") do
-                        table.insert(keywordList, keyword:match("^%s*(.-)%s*$")) -- trim whitespace
-                    end
+                    local keywordList = Common.parseKeywordCsv(props.keywords)
                     Common.addKeywordsWithParent(catalog, selectedPhoto, keywordList)
                 end
             end)

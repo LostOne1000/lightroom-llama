@@ -44,4 +44,5 @@ return {
     addKeywordsWithParent = MetadataService.addKeywordsWithParent,
     getLlmKeywordsFromPhoto = MetadataService.getLlmKeywordsFromPhoto,
     removeLlmKeywords = MetadataService.removeLlmKeywords,
+    parseKeywordCsv = MetadataService.parseKeywordCsv,
 }

@@ -33,6 +33,7 @@ describe("Common.lua delegation", function()
             assert.is_function(Common.addKeywordsWithParent)
             assert.is_function(Common.getLlmKeywordsFromPhoto)
             assert.is_function(Common.removeLlmKeywords)
+            assert.is_function(Common.parseKeywordCsv)
         end)
 
         it("exports correct default values", function()
@@ -81,6 +82,30 @@ describe("Common.lua delegation", function()
     describe("fetchAvailableModels wrapper", function()
         it("is a function, not a table or nil", function()
             assert.is_function(Common.fetchAvailableModels)
+        end)
+    end)
+
+    describe("parseKeywordCsv delegation", function()
+        it("parses tricky CSV correctly", function()
+            local got = Common.parseKeywordCsv("sunset,, beach,   ,portrait")
+            assert.are_same({ "sunset", "beach", "portrait" }, got)
+        end)
+    end)
+
+    --------------------------------------------------------------------
+    -- Production wiring: LrLlama.lua must use the tested parser
+    --------------------------------------------------------------------
+    describe("production wiring", function()
+        it("uses Common.parseKeywordCsv and has no inline keyword parsing loop", function()
+            local source = assert(io.open(path .. "LrLlama.lua", "r")):read("*a")
+            assert.truthy(
+                string.find(source, "Common%.parseKeywordCsv"),
+                "LrLlama.lua should call Common.parseKeywordCsv"
+            )
+            assert.falsy(
+                string.find(source, "gmatch.*keywords.*%[%,", nil, true),
+                "LrLlama.lua should not contain inline gmatch keyword parsing"
+            )
         end)
     end)
 end)
