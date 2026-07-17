@@ -1,3 +1,7 @@
+--- BatchLrLlama.lua — Batch metadata generation for multiple photos.
+--- Processes selected photos sequentially with progress tracking, saving all
+--- metadata in a single catalog write transaction at the end.
+
 local LrApplication = import "LrApplication"
 local LrDialogs = import "LrDialogs"
 local LrView = import "LrView"
@@ -16,6 +20,9 @@ local Common = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Common.lua"))))
 -- Batch processing results display
 --------------------------------------------------------------------------------
 
+--- Summarize batch processing results. Shows a dialog only if there were failures;
+--- silent success avoids unnecessary popups when all photos process cleanly.
+---@param results table Array of {success, error?, metadata?, photo?} records
 local function showBatchResults(results)
     local successful = 0
     local failed = 0
@@ -59,7 +66,14 @@ end
 -- Batch dialog + processing
 --------------------------------------------------------------------------------
 
+--- Show the batch configuration dialog, then process photos sequentially.
+--- Uses `LrProgressScope` for cancellable long-running operations. All API calls
+--- run synchronously inside the progress loop (not async) so that progress updates
+--- are ordered and deterministic. User settings are persisted via LrPrefs.
+---@param selectedPhotos table<LrPhoto> Array of selected photos
 local function showBatchDialog(selectedPhotos)
+    -- Dialog lifecycle is wrapped in callWithContext so that LrBinding properties
+    -- (status text, dropdowns, checkboxes) update live.
     LrFunctionContext.callWithContext("showBatchDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
         local prefs = LrPrefs.prefsForPlugin()
@@ -217,7 +231,8 @@ local function showBatchDialog(selectedPhotos)
             prefs.batchGenerateKeywords = props.generateKeywords
             prefs.batchSelectedModel = props.selectedModel
 
-            -- Validate server host before saving
+            -- Validate host after dialog closes but before processing starts.
+            -- If invalid, return early — processing is aborted entirely.
             local ok, validatedHost = Common.validateServerHost(props.serverHost)
             if not ok then
                 LrDialogs.message(
@@ -307,7 +322,8 @@ local function showBatchDialog(selectedPhotos)
                 progressScope:done()
             end)
 
-            -- Save all metadata in a single write access call
+            -- Single withWriteAccessDo for all photos — batched writes are much faster
+            -- than per-photo transactions and guarantee atomicity (all-or-nothing).
             catalog:withWriteAccessDo("Save Llama batch metadata", function()
                 for _, result in ipairs(results) do
                     if result.success and result.metadata then
@@ -336,6 +352,9 @@ end
 -- Main entry point
 --------------------------------------------------------------------------------
 
+--- Entry point. Validates photo selection and delegates to showBatchDialog.
+--- If only one photo is selected, prompts the user to either continue with batch
+--- mode or use the regular (single-photo) dialog instead.
 local function main()
     local catalog = LrApplication.activeCatalog()
     local selectedPhotos = catalog:getTargetPhotos()

@@ -1,5 +1,9 @@
 -- Common.lua — Shared utilities for Lightroom Llama plugin
--- Loaded by LrLlama.lua, BatchLrLlama.lua, ResetMetadata.lua
+--- Loaded by LrLlama.lua, BatchLrLlama.lua, and ResetMetadata.lua. Provides thumbnail
+--- export, Ollama API communication, model discovery, keyword management, and server
+--- address validation. All public functions are exported via the return table at EOF.
+---
+--- SDK imports: LrHttp, LrLogger, LrFileUtils, LrStringUtils, LrTasks, LrPrefs
 
 local LrHttp = import 'LrHttp'
 local LrPathUtils = import 'LrPathUtils'
@@ -12,8 +16,12 @@ local LrPrefs = import "LrPrefs"
 local logger = LrLogger('LrLlama')
 logger:enable("logfile") -- Logs to ~/Documents/LrClassicLogs | tail -f LrLlama.log
 
+--- Default Ollama model name; change here to switch models.
+---@type string
 local model = "gemma4:latest"
 
+--- Fallback server address when prefs are missing, empty, or invalid.
+---@type string
 local defaultServerHost = "localhost:11434"
 
 --------------------------------------------------------------------------------
@@ -21,6 +29,12 @@ local defaultServerHost = "localhost:11434"
 -- Returns (true, normalized_host) or (false, error_message)
 --------------------------------------------------------------------------------
 
+--- Validate and normalize an Ollama server address.
+--- Strips optional scheme (`http://`) and trailing slashes, then verifies the
+--- string is `hostname:port`. Accepts localhost, IP addresses, and domain names.
+---@param input string|nil User-supplied server address (may be empty)
+---@return bool ok    True when the address is valid
+---@return string result The normalized host:port on success, error message on failure
 local function validateServerHost(input)
     if not input or input == "" then
         return true, defaultServerHost  -- treat empty as "use default"
@@ -48,17 +62,19 @@ local function validateServerHost(input)
     return true, hostnamePart .. ":" .. portPart
 end
 
---------------------------------------------------------------------------------
--- Constructs the Ollama base URL from stored preferences
---------------------------------------------------------------------------------
-
+--- Build the base URL for Ollama API calls.
+--- Reads `prefs.ollamaServerHost`, validates it, and falls back to
+--- `defaultServerHost` if the stored value is malformed. Always returns a valid URL.
+---@return string Base URL (e.g., "http://localhost:11434")
 local function getOllamaBaseUrl()
     local prefs = LrPrefs.prefsForPlugin()
     local ok, host = validateServerHost(prefs.ollamaServerHost)
+
     if not ok then
         logger:warn("Invalid server host in prefs: " .. tostring(prefs.ollamaServerHost))
-        host = defaultServerHost  -- fall back on bad pref data
+        host = defaultServerHost
     end
+
     return "http://" .. host
 end
 
@@ -68,6 +84,10 @@ JSON = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "JSON.lua"))))()
 -- Model discovery
 --------------------------------------------------------------------------------
 
+--- Convert a plain list of model names into the `{title, value}` format that
+--- LrView `popup_menu` requires for its `items` binding.
+---@param modelNames table<string> List of model strings (from fetchAvailableModels)
+---@return table<table> Table of `{title = m, value = m}` entries for popup_menu binding
 local function makeModelItems(modelNames)
     local items = {}
     for _, m in ipairs(modelNames) do
@@ -76,6 +96,10 @@ local function makeModelItems(modelNames)
     return items
 end
 
+--- Query Ollama's `/api/tags` endpoint for installed models.
+--- Falls back to `{model}` (the default) on network errors, malformed JSON,
+--- or an empty model list — so callers never receive nil.
+---@return table<string> List of model name strings; always non-empty.
 local function fetchAvailableModels()
     logger:info("Fetching available models from Ollama")
 
@@ -119,6 +143,14 @@ local function fetchAvailableModels()
     return { model }
 end
 
+--- Persist the server host and rebuild the model dropdown.
+--- MUST be called from within `LrTasks.startAsyncTask()` — LrBinding only
+--- propagates property reassignments (modelItems, selectedModel) when done
+--- off the UI thread.
+---@param props table LrBinding property table containing serverHost, modelItems, selectedModel
+---@param prefs table LrPrefs prefsForPlugin() instance
+---@return bool ok True on success
+---@return string message Human-readable status or error description
 local function saveServerAndRefresh(props, prefs)
     local ok, validatedHost = validateServerHost(props.serverHost)
     if not ok then
@@ -148,24 +180,32 @@ local function saveServerAndRefresh(props, prefs)
     return true, string.format("Loaded %d model(s)", #availableModels)
 end
 
---------------------------------------------------------------------------------
--- Thumbnail export
---------------------------------------------------------------------------------
-
+--- Export a 512×512 JPEG thumbnail to a unique temp file.
+--- **Side effect:** writes a file to the system temp directory.
+--- Caller is responsible for deleting the returned file after use.
+---@param photo LrPhoto Photo object from the catalog
+---@return string|nil Absolute path on success, nil on failure
 local function exportThumbnail(photo)
     local tempPath = LrFileUtils.chooseUniqueFileName(LrPathUtils.getStandardFilePath('temp') .. "/thumbnail.jpg")
     logger:info("Attempting to export thumbnail to: " .. tempPath)
 
-    -- Check if temp directory is accessible
+    -- Validate that the temp directory exists and is accessible before proceeding
+    -- This prevents silent failures when the temp directory is missing or restricted
     local tempDir = LrPathUtils.getStandardFilePath('temp')
     if not LrFileUtils.exists(tempDir) then
         logger:error("Temp directory does not exist: " .. tempDir)
         return nil
     end
 
+    -- Track whether the thumbnail callback successfully wrote data
+    -- This flag is set inside the callback to communicate success back to the caller
     local thumbnailSaved = false
+    -- Request a 512x512 JPEG thumbnail asynchronously
+    -- photo:requestJpegThumbnail() returns (success, result) and executes the callback
+    -- with the JPEG binary data if available
     local success, result = photo:requestJpegThumbnail(512, 512, function(jpegData)
         if jpegData then
+            -- Open temp file in binary write mode ("wb") to preserve JPEG data integrity
             local tempFile = io.open(tempPath, "wb")
             if tempFile then
                 tempFile:write(jpegData)
@@ -183,8 +223,10 @@ local function exportThumbnail(photo)
         end
     end)
 
+    -- Verify both the API call succeeded AND the callback wrote the file
     if success and thumbnailSaved then
-        -- Verify the file was actually created
+        -- Final verification: ensure the file actually exists on disk
+        -- This catches edge cases where the write appeared successful but the file is missing
         if LrFileUtils.exists(tempPath) then
             logger:info("Thumbnail export successful: " .. tempPath)
             return tempPath
@@ -202,6 +244,9 @@ end
 -- Base64 encoding
 --------------------------------------------------------------------------------
 
+--- Read a JPEG file and return its Base64-encoded representation.
+---@param imagePath string Absolute path to the JPEG file
+---@return string|nil Base64 string on success, nil if file unreadable or empty
 local function base64EncodeImage(imagePath)
     logger:info("Attempting to encode image: " .. imagePath)
 
@@ -318,17 +363,19 @@ Before finalizing, ensure:
 
 --------------------------------------------------------------------------------
 -- API communication
----@param photo LrPhoto The photo to send to the API
----@param prompt string The prompt to send to the API
----@param currentData table (optional) The current title, caption, and keywords of the photo
----@param useCurrentData boolean (optional) Whether to use the current title and caption
----@param useSystemPrompt boolean (optional) Whether to use the system prompt
----@param selectedModel string (optional) The model name to use; falls back to default
----@param systemPrompt string (optional) Custom system prompt; defaults to detailed prompt
----@return table response The response from the API or nil on error
----@return string error Error message or nil on success
---------------------------------------------------------------------------------
-
+--- Export a thumbnail, encode it as Base64, and POST to Ollama's `/api/generate`.
+--- Retries thumbnail export up to 3 times. Cleans up the temp file after the
+--- HTTP request regardless of success or failure. Validates the JSON response
+--- has title (string), caption (string), and keywords (array of non-empty strings).
+---@param photo LrPhoto Photo object from the catalog
+---@param prompt string User-facing prompt text
+---@param currentData table|nil Existing title/caption to prepend when useCurrentData is true
+---@param useCurrentData boolean Whether to include current metadata in the prompt
+---@param useSystemPrompt boolean Whether to send a system prompt alongside the user prompt
+---@param selectedModel string|nil Model name; falls back to the default if nil
+---@param systemPrompt string|nil Override for the built-in system prompt
+---@return table|nil response Parsed JSON on success ({title, caption, keywords})
+---@return string|nil err Error message, or nil on success
 local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSystemPrompt, selectedModel, systemPrompt)
     logger:info("Sending data to API")
 
@@ -391,7 +438,9 @@ local function sendDataToApi(photo, prompt, currentData, useCurrentData, useSyst
 
         local rawResponse = response_data.response
 
-        -- Strip markdown code fences (many Ollama models wrap JSON in ```json ... ```)
+        -- Many Ollama models emit markdown-wrapped JSON ("```json\n{...}\n```").
+        -- Strip the fences so JSON:decode receives bare JSON. Two patterns handle
+        -- both ```json and bare ``` variants.
         rawResponse = string.gsub(rawResponse, "^%s*```%w+\n?", "")
         rawResponse = string.gsub(rawResponse, "\n?```%s*$", "")
         rawResponse = string.gsub(rawResponse, "^%s*```%s*\n?", "")
@@ -433,6 +482,13 @@ end
 -- Keyword management
 --------------------------------------------------------------------------------
 
+--- Add keywords under the `llm` parent keyword.
+--- Creates (or retrieves) a top-level `llm` keyword, then adds each entry as a child
+--- and associates it with the photo. Idempotent — safe to call on photos that
+--- already have LLM keywords.
+---@param catalog LrCatalog Active catalog (from LrApplication.activeCatalog())
+---@param photo LrPhoto Target photo
+---@param keywords table<string> Array of keyword strings
 local function addKeywordsWithParent(catalog, photo, keywords)
     if not keywords or type(keywords) ~= "table" then
         return
@@ -457,6 +513,11 @@ local function addKeywordsWithParent(catalog, photo, keywords)
     end
 end
 
+--- Read existing LLM-generated keywords from a photo.
+--- Filters all keywords to only those whose parent is `llm`. Wrapped in
+--- `pcall` so that malformed keyword data doesn't crash the plugin.
+---@param photo LrPhoto Target photo
+---@return table<string> Array of keyword name strings (may be empty)
 local function getLlmKeywordsFromPhoto(photo)
     local llmKeywords = {}
 
@@ -482,6 +543,11 @@ local function getLlmKeywordsFromPhoto(photo)
     return llmKeywords
 end
 
+--- Remove all `llm`-parented keywords from a photo.
+--- Only removes the keyword-to-photo association — does not delete the keyword
+--- definitions from the catalog (other photos may reference them).
+---@param catalog LrCatalog Active catalog
+---@param photo LrPhoto Target photo
 local function removeLlmKeywords(catalog, photo)
     local allKeywords = photo:getRawMetadata("keywords")
     if not allKeywords then
@@ -502,7 +568,7 @@ local function removeLlmKeywords(catalog, photo)
 end
 
 --------------------------------------------------------------------------------
--- Public API
+--- Public API — imported by LrLlama.lua, BatchLrLlama.lua, ResetMetadata.lua
 --------------------------------------------------------------------------------
 
 return {

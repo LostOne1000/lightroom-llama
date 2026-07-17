@@ -1,3 +1,7 @@
+--- LrLlama.lua — Single-photo metadata generation.
+--- Invoked from Library or Export menus. Exports a thumbnail, sends it to Ollama,
+--- and presents the generated title, caption, and keywords in an editable dialog.
+
 local LrApplication = import "LrApplication"
 local LrDialogs = import "LrDialogs"
 local LrView = import "LrView"
@@ -11,7 +15,10 @@ local LrPathUtils = import 'LrPathUtils'
 -- Load shared utilities (includes logger, model constant, JSON loader, shared functions)
 local Common = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Common.lua"))))()
 
--- The original system prompt from LrLlama.lua (preserved for single-image use)
+--- Legacy system prompt used only by the single-photo dialog.
+--- Simpler and more permissive than Common.defaultSystemPrompt — allows broader
+--- keyword ranges and retains existing metadata verbatim. Passed to sendDataToApi
+--- as the systemPrompt override so single-photo mode differs from batch mode.
 local originalSystemPrompt = [[You are an AI tasked with creating a JSON object containing a `title`, a `caption`, and a list of `keywords` based on a given piece of content (such as an image or video). ]] ..
 [[The content currently has the following metadata which you need to implement and improve upon. It is important to keep the title and caption as close to this as possible.
 
@@ -59,21 +66,23 @@ Use this structure and guidelines to generate titles, captions, and keywords tha
 
 -- Note: saveServerAndRefresh moved to Common.lua — used by both dialogs
 
+--- Entry point. Invoked via `LrTasks.startAsyncTask(main)` — required by the
+--- Lightroom SDK for menu-activated plugins. Shows a modal dialog that lets the
+--- user generate and edit title, caption, and keywords for one photo.
 local function main()
-    -- Get the active catalog
     local catalog = LrApplication.activeCatalog()
-
-    -- Get the selected photo
-    local selectedPhotos = catalog:getTargetPhotos() -- Gets all selected photos
+    local selectedPhotos = catalog:getTargetPhotos()
     if #selectedPhotos == 0 then
         LrDialogs.message("No photo selected", "Please select a photo to view.", "critical")
         return
     end
 
-    -- Get the first selected photo (if multiple, you can modify the code for more)
+    -- Single-photo mode only processes the first selection; batch mode handles multiples.
     local selectedPhoto = selectedPhotos[1]
     local thumbnailPath = Common.exportThumbnail(selectedPhoto)
 
+    -- LrBinding requires a live function context for property tables. Without it,
+    -- bound UI elements (edit fields, checkboxes, status text) won't update live.
     LrFunctionContext.callWithContext("showLlamaDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
         local prefs = LrPrefs.prefsForPlugin()
@@ -86,6 +95,8 @@ local function main()
         local existingLlmKeywords = Common.getLlmKeywordsFromPhoto(selectedPhoto)
         props.keywords = table.concat(existingLlmKeywords, ", ")
         props.response = ""
+        -- Pre-check so the "Use current title and caption" checkbox is only enabled
+        -- when there's actually existing metadata to include.
         props.useCurrentData = props.title ~= "" or props.caption ~= ""
         props.serverHost = prefs.ollamaServerHost or Common.defaultServerHost
         props.useSystemPrompt = true
@@ -240,6 +251,9 @@ local function main()
                         props.status = "The llama is thinking..."
                         props.statusColor = LrColor(0.439, 0.345, 0.745)
 
+                        -- API call must run off the UI thread. LrBinding properties can
+                        -- be mutated from this async callback — they'll propagate live
+                        -- to the dialog while we're still inside callWithContext above.
                         LrTasks.startAsyncTask(function()
                             local apiResponse, apiError = Common.sendDataToApi(
                                 selectedPhoto,
@@ -272,6 +286,7 @@ local function main()
                     width = 10
                 }, f:push_button{
                     title = "Save Server",
+                    -- saveServerAndRefresh must run async so LrBinding picks up modelItems changes
                     action = function()
                         props.status = "Refreshing models..."
                         props.statusColor = LrColor(0.439, 0.345, 0.745)
@@ -317,7 +332,8 @@ local function main()
                 prefs.ollamaServerHost = validatedHost
             end
 
-            -- Save the metadata to the photo
+            -- All catalog mutations must run inside withWriteAccessDo — Lightroom
+            -- wraps the callback in a transaction and silently discards changes outside it.
             catalog:withWriteAccessDo("Save Llama metadata", function()
                 selectedPhoto:setRawMetadata("title", props.title)
                 selectedPhoto:setRawMetadata("caption", props.caption)

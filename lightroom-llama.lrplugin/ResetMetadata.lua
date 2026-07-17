@@ -1,3 +1,7 @@
+--- ResetMetadata.lua — Clear AI-generated metadata from photos.
+--- Allows selective reset of title, caption, and keywords (only those under
+--- the `llm` parent). Two-step confirmation flow prevents accidental deletion.
+
 local LrApplication = import "LrApplication"
 local LrDialogs = import "LrDialogs"
 local LrView = import "LrView"
@@ -15,6 +19,10 @@ local Common = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Common.lua"))))
 -- Reset dialog + processing
 --------------------------------------------------------------------------------
 
+--- Present a dialog for selecting which metadata to reset, then execute the reset.
+--- Two-step confirmation (dialog → explicit confirm) prevents accidental data loss.
+--- Settings are persisted via LrPrefs so user choices carry over between sessions.
+---@param selectedPhotos table<LrPhoto> Array of selected photos
 local function showResetDialog(selectedPhotos)
     local settings = nil
 
@@ -117,7 +125,9 @@ local function showResetDialog(selectedPhotos)
         end
     end)
 
-    -- Execute the reset OUTSIDE the function context (like BatchLrLlama.lua does)
+    -- withWriteAccessDo must run outside callWithContext — nesting them can cause
+    -- Lightroom SDK to hang. The dialog (inside callWithContext) returns first,
+    -- then we perform the catalog mutations here in the outer scope.
     if settings then
         local catalog = LrApplication.activeCatalog()
 
@@ -146,6 +156,8 @@ end
 -- Main entry point
 --------------------------------------------------------------------------------
 
+--- Entry point. Validates that at least one photo is selected, then delegates
+--- to showResetDialog.
 local function main()
     local catalog = LrApplication.activeCatalog()
     local selectedPhotos = catalog:getTargetPhotos()
