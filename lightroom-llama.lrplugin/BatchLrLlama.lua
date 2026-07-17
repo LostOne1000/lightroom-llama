@@ -1,3 +1,7 @@
+--- BatchLrLlama.lua — Batch metadata generation for multiple photos.
+--- Processes selected photos sequentially with progress tracking, saving all
+--- metadata in a single catalog write transaction at the end.
+
 local LrApplication = import "LrApplication"
 local LrDialogs = import "LrDialogs"
 local LrView = import "LrView"
@@ -16,6 +20,9 @@ local Common = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Common.lua"))))
 -- Batch processing results display
 --------------------------------------------------------------------------------
 
+--- Summarize batch processing results. Shows a dialog only if there were failures;
+--- silent success avoids unnecessary popups when all photos process cleanly.
+---@param results table Array of {success, error?, metadata?, photo?} records
 local function showBatchResults(results)
     local successful = 0
     local failed = 0
@@ -59,7 +66,14 @@ end
 -- Batch dialog + processing
 --------------------------------------------------------------------------------
 
+--- Show the batch configuration dialog, then process photos sequentially.
+--- Uses `LrProgressScope` for cancellable long-running operations. All API calls
+--- run synchronously inside the progress loop (not async) so that progress updates
+--- are ordered and deterministic. User settings are persisted via LrPrefs.
+---@param selectedPhotos table<LrPhoto> Array of selected photos
 local function showBatchDialog(selectedPhotos)
+    -- Dialog lifecycle is wrapped in callWithContext so that LrBinding properties
+    -- (status text, dropdowns, checkboxes) update live.
     LrFunctionContext.callWithContext("showBatchDialog", function(context)
         local props = LrBinding.makePropertyTable(context)
         local prefs = LrPrefs.prefsForPlugin()
@@ -72,13 +86,15 @@ local function showBatchDialog(selectedPhotos)
         props.generateTitle = prefs.batchGenerateTitle ~= false -- Default to true
         props.generateCaption = prefs.batchGenerateCaption ~= false -- Default to true
         props.generateKeywords = prefs.batchGenerateKeywords ~= false -- Default to true
+        props.serverHost = prefs.ollamaServerHost or Common.defaultServerHost
+        props.status = "Ready"
+        props.statusColor = LrColor(0.149, 0.616, 0.412)
+
+        -- Note: saveServerAndRefresh moved to Common.lua
 
         -- Fetch available models from Ollama and populate the dropdown
         local availableModels = Common.fetchAvailableModels()
-        props.modelItems = {}
-        for _, m in ipairs(availableModels) do
-            table.insert(props.modelItems, { title = m, value = m })
-        end
+        props.modelItems = Common.makeModelItems(availableModels)
         props.selectedModel = prefs.batchSelectedModel or availableModels[1]  -- restore preference or default to first
 
         local f = LrView.osFactory()
@@ -134,11 +150,25 @@ local function showBatchDialog(selectedPhotos)
                 f:separator{width = 400},
                 f:spacer{height = 10},
 
+                f:static_text{title = "Ollama Server:", alignment = 'left'},
+                f:spacer{f:label_spacing{}},
+                f:row{
+                    f:edit_field{
+                        value = LrView.bind("serverHost"),
+                        width = 250,
+                    },
+                    f:static_text{
+                        title = "(default: localhost:11434)",
+                        text_color = LrColor(0.6, 0.6, 0.6)
+                    }
+                },
+                f:spacer{height = 10},
+
                 f:static_text{title = "Model:", alignment = 'left'},
                 f:spacer{f:label_spacing{}},
                 f:popup_menu{
                     value = LrView.bind("selectedModel"),
-                    items = props.modelItems,
+                    items = LrView.bind("modelItems"),
                     width = 250,
                 },
                 f:spacer{height = 10},
@@ -147,7 +177,39 @@ local function showBatchDialog(selectedPhotos)
                     title = "Note: This process may take several minutes depending on the number of photos.",
                     font = "<system>",
                     text_color = LrColor(0.6, 0.6, 0.6)
-                }
+                },
+                f:spacer{height = 10},
+                f:row{f:static_text{
+                    fill_horizontal = 1
+                }, f:static_text{
+                    alignment = 'right',
+                    title = LrView.bind("status"),
+                    width = 200,
+                    font = "<system/bold>",
+                    text_color = LrView.bind("statusColor")
+                }},
+                f:spacer{height = 10},
+                f:separator{width = 400},
+                f:spacer{height = 10},
+                f:row{f:push_button{
+                    title = "Save Server",
+                    action = function()
+                        props.status = "Refreshing models..."
+                        props.statusColor = LrColor(0.439, 0.345, 0.745)
+
+                        LrTasks.startAsyncTask(function()
+                            local ok, msg = Common.saveServerAndRefresh(props, prefs)
+
+                            if not ok then
+                                props.status = "Error: " .. msg
+                                props.statusColor = LrColor(0.8, 0.2, 0.2)
+                            else
+                                props.status = msg
+                                props.statusColor = LrColor(0.149, 0.616, 0.412)
+                            end
+                        end)
+                    end
+                }},
             }
         }
 
@@ -157,6 +219,7 @@ local function showBatchDialog(selectedPhotos)
             actionVerb = "Start Processing"
         })
 
+        -- Only process if Start Processing was clicked (not Cancel/ESC)
         if result == "ok" then
             -- Save preferences for next time
             prefs.batchPrompt = props.prompt
@@ -167,6 +230,19 @@ local function showBatchDialog(selectedPhotos)
             prefs.batchGenerateCaption = props.generateCaption
             prefs.batchGenerateKeywords = props.generateKeywords
             prefs.batchSelectedModel = props.selectedModel
+
+            -- Validate host after dialog closes but before processing starts.
+            -- If invalid, return early — processing is aborted entirely.
+            local ok, validatedHost = Common.validateServerHost(props.serverHost)
+            if not ok then
+                LrDialogs.message(
+                    "Invalid Server Address",
+                    validatedHost .. "\n\nPlease enter it as host:port (e.g., localhost:11434 or 192.168.1.10:11434).",
+                    "warning"
+                )
+                return  -- abort; keep dialog open so the user can correct it
+            end
+            prefs.ollamaServerHost = validatedHost
 
             local settings = {
                 prompt = props.prompt,
@@ -246,7 +322,8 @@ local function showBatchDialog(selectedPhotos)
                 progressScope:done()
             end)
 
-            -- Save all metadata in a single write access call
+            -- Single withWriteAccessDo for all photos — batched writes are much faster
+            -- than per-photo transactions and guarantee atomicity (all-or-nothing).
             catalog:withWriteAccessDo("Save Llama batch metadata", function()
                 for _, result in ipairs(results) do
                     if result.success and result.metadata then
@@ -275,6 +352,9 @@ end
 -- Main entry point
 --------------------------------------------------------------------------------
 
+--- Entry point. Validates photo selection and delegates to showBatchDialog.
+--- If only one photo is selected, prompts the user to either continue with batch
+--- mode or use the regular (single-photo) dialog instead.
 local function main()
     local catalog = LrApplication.activeCatalog()
     local selectedPhotos = catalog:getTargetPhotos()
