@@ -20,8 +20,63 @@ local PromptBuilder = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "PromptBu
 local ResponseValidator = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "ResponseValidator.lua"))))()
 
 --------------------------------------------------------------------------------
+--- Helpers for exception-safe cleanup
+--------------------------------------------------------------------------------
+
+--- Pack variadic returns preserving nil positions (Lua 5.1 compatible).
+---@return table results Table with `.n` count and packed values
+local function pack(...)
+    return { n = select("#", ...), ... }
+end
+
+-- Lua 5.1: unpack is a global; Lua 5.2+: it moved to table.unpack.
+local unpack = unpack or table.unpack
+
+--- Run *operation* under pcall, then always attempt *cleanupFn*.
+--- Guarantees the temp thumbnail is deleted regardless of how the
+--- generation pipeline exits (success, returned failure, or exception).
+---
+--- Error preservation:
+---   - Generation fails + cleanup succeeds → return original error
+---   - Generation fails + cleanup fails    → return original error; log cleanup
+---   - Generation succeeds + cleanup fails → return cleanup error (no false success)
+--- The `results` table is filled by `pack()` inside pcall so multiple return
+--- values from the operation survive the protected call.
+---@param thumbnailPath string  Path to delete after operation
+---@param operation function    Generation logic returning zero or more values
+---@param cleanupFn function   Cleanup function accepting the path
+---@param activeLogger table   Logger for dual-failure diagnostics
+---@return ... The return values of *operation* on success, or `nil, error` on failure
+local function runWithCleanup(thumbnailPath, operation, cleanupFn, activeLogger)
+    local results = { n = 0 }
+
+    local ok, errInfo = pcall(function()
+        results = pack(operation())
+    end)
+
+    -- Always attempt cleanup regardless of operation outcome.
+    local cleanupOk, cleanupErr = pcall(cleanupFn, thumbnailPath)
+
+    if not ok then
+        -- Generation threw an exception.
+        if not cleanupOk then
+            activeLogger:error(
+                "Thumbnail cleanup also failed: " .. tostring(cleanupErr)
+            )
+        end
+        return nil, errInfo
+    end
+
+    -- Generation succeeded but cleanup failed — do not report success.
+    if not cleanupOk then
+        return nil, "Failed to clean up thumbnail: " .. tostring(cleanupErr)
+    end
+
+    return unpack(results, 1, results.n)
+end
+
+--------------------------------------------------------------------------------
 --- Constructor — create a client with injectable dependencies.
---- Each dep falls back to the real Lightroom SDK when omitted, so production
 --- callers need no changes while tests can provide lightweight fakes.
 ---@param deps table|nil Optional dependency overrides:
 ---   { http, prefs, tasks, json, thumbnailService, promptBuilder, responseValidator, logger }
@@ -208,12 +263,73 @@ local function createClient(deps)
     -- Generate pipeline
     --------------------------------------------------------------------------------
 
+    --- Export thumbnail with retry logic (up to 3 attempts, 500ms between failures).
+    ---@param photo LrPhoto Photo object from the catalog
+    ---@return string|nil Path on success, nil after all retries exhausted
+    local function exportWithRetries(photo)
+        for attempt = 1, 3 do
+            local path = thumbnailService.export(photo)
+            if path then
+                return path
+            end
+            activeLogger:warn("Thumbnail export attempt " .. attempt .. " failed, retrying...")
+            tasks.sleep(0.5) -- Wait 500ms before retry
+        end
+        return nil
+    end
+
+    --- Execute the HTTP POST step: encode, build prompt, assemble body, send request.
+    --- Returns the raw HTTP response string (or nil on failure). Cleanup is NOT
+    --- performed here — it is the responsibility of `runWithCleanup`.
+    ---@param thumbnailPath string Path to exported JPEG
+    ---@param userInstruction string User-facing prompt text
+    ---@param currentData table|nil Existing title/caption
+    ---@param useCurrentData boolean Include current metadata in prompt
+    ---@param useSystemPrompt boolean Send system prompt
+    ---@param selectedModel string|nil Model name
+    ---@param systemPromptOverride string|nil Custom system prompt
+    ---@return string|nil rawResponse HTTP response body, or nil
+    ---@return string|nil err Error message
+    local function executePost(thumbnailPath, userInstruction, currentData,
+                               useCurrentData, useSystemPrompt, selectedModel,
+                               systemPromptOverride)
+        -- Encode image as Base64
+        local encodedImage = thumbnailService.encodeBase64(thumbnailPath)
+        if not encodedImage then
+            return nil, "Failed to encode image"
+        end
+
+        -- Build user prompt and request body
+        local builtPrompt = promptBuilder.buildUserPrompt(userInstruction, currentData, useCurrentData)
+        local requestBody = promptBuilder.assembleRequestBody(
+            builtPrompt, selectedModel or client.defaultModel,
+            useSystemPrompt, systemPromptOverride
+        )
+        requestBody.images = {encodedImage}
+
+        -- Send HTTP POST
+        local url = client.getBaseUrl(prefsService.prefsForPlugin()) .. "/api/generate"
+        local jsonPayload = json:encode(requestBody)
+
+        local response = http.post(url, jsonPayload, {{
+            field = "Content-Type",
+            value = "application/json"
+        }})
+
+        if not response then
+            return nil, "Failed to send data to the API"
+        end
+
+        -- Return raw response for validation (after cleanup in caller).
+        return response, nil
+    end
+
     --- High-level generate: export thumbnail, encode, build prompt, POST, validate response.
     --- Orchestrates ThumbnailService + PromptBuilder + ResponseValidator internally.
     --- This is the decomposition of the former Common.sendDataToApi mega-function.
     --- Retries thumbnail export up to 3 times. Cleans up the temp file after the
-    --- HTTP request regardless of success or failure. Validates the JSON response
-    --- has title (string), caption (string), and keywords (array of non-empty strings).
+    --- HTTP request regardless of success or failure (even when downstream code throws).
+    --- Validation runs after cleanup so the thumbnail is always removed first.
    ---@param photo LrPhoto Photo object from the catalog
    ---@param userInstruction string User-facing prompt text
    ---@param currentData table|nil Existing title/caption to prepend when useCurrentData is true
@@ -227,54 +343,32 @@ local function createClient(deps)
                              useSystemPrompt, selectedModel, systemPromptOverride)
         activeLogger:info("Sending data to API")
 
-        -- 1. Export thumbnail with retry (up to 3 attempts)
-        local thumbnailPath = nil
-        for attempt = 1, 3 do
-            thumbnailPath = thumbnailService.export(photo)
-            if thumbnailPath then
-                break
-            end
-            activeLogger:warn("Thumbnail export attempt " .. attempt .. " failed, retrying...")
-            tasks.sleep(0.5) -- Wait 500ms before retry
-        end
-
+        -- Export thumbnail with retry; early return avoids cleanup when nothing created.
+        local thumbnailPath = exportWithRetries(photo)
         if not thumbnailPath then
             return nil, "Failed to export thumbnail after 3 attempts"
         end
 
-        -- 2. Encode image as Base64
-        local encodedImage = thumbnailService.encodeBase64(thumbnailPath)
-        if not encodedImage then
-            thumbnailService.cleanup(thumbnailPath)
-            return nil, "Failed to encode image"
-        end
-
-        -- 3. Build user prompt and request body
-        local builtPrompt = promptBuilder.buildUserPrompt(userInstruction, currentData, useCurrentData)
-        local requestBody = promptBuilder.assembleRequestBody(
-            builtPrompt, selectedModel or client.defaultModel,
-            useSystemPrompt, systemPromptOverride
+        -- Run the HTTP POST under exception-safe cleanup: thumbnail is deleted after
+        -- the request regardless of success or exception.
+        local rawResponse, err = runWithCleanup(
+            thumbnailPath,
+            function()
+                return executePost(thumbnailPath, userInstruction, currentData,
+                                   useCurrentData, useSystemPrompt, selectedModel,
+                                   systemPromptOverride)
+            end,
+            function(path) thumbnailService.cleanup(path) end,
+            activeLogger
         )
-        requestBody.images = {encodedImage}
 
-        -- 4. Send HTTP POST
-        local url = client.getBaseUrl(prefsService.prefsForPlugin()) .. "/api/generate"
-        local jsonPayload = json:encode(requestBody)
-
-        local response = http.post(url, jsonPayload, {{
-            field = "Content-Type",
-            value = "application/json"
-        }})
-
-        -- 5. Clean up thumbnail file (always, regardless of success)
-        thumbnailService.cleanup(thumbnailPath)
-
-        -- 6. Parse and validate response
-        if not response then
-            return nil, "Failed to send data to the API"
+        -- If POST/cleanup failed, return immediately.
+        if not rawResponse then
+            return nil, err
         end
 
-        return responseValidator.validateAndParse(response)
+        -- Validate after cleanup so the thumbnail is always removed first.
+        return responseValidator.validateAndParse(rawResponse)
     end
 
     return client
