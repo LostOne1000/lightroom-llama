@@ -50,6 +50,10 @@ Generated keywords are nested under a parent keyword named `llm`. The `addKeywor
 
 - There is **no build system** — the `.lrplugin` directory is loaded directly by Lightroom. Changes are picked up by restarting Lightroom or reloading the plugin via File > Plug-in Manager.
 - Logs are written to `~/Documents/LrClassicLogs/LrLlama.log`. Tail with: `tail -f ~/Documents/LrClassicLogs/LrLlama.log`
-- The model name is hardcoded at `LrLlama.lua:19`. Change it to switch models.
+- The model name is hardcoded at `Common.lua:21`. Change it to switch models.
 - `request.txt` in the repo root contains a reference `curl` command for testing the Ollama API manually.
 - To test the plugin, install it in Lightroom Classic via File > Plug-in Manager > Add, then navigate to the `.lrplugin` folder.
+
+### Commenting Standard
+
+Public functions use **LuaLS annotations** (`---`, `---@param`, `---@return`) for IDE hover docs and type hints. Implementation notes are `--` inline blocks explaining *why*, not *what*. Section headers use `--------------------------------------------------------------------------------` separators. When adding new functions, follow the existing pattern: prose summary + `---@param name type description` per parameter + `---@return type description`.
