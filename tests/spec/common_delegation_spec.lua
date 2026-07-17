@@ -93,15 +93,23 @@ describe("Common.lua delegation", function()
     end)
 
     --------------------------------------------------------------------
-    -- Production wiring: LrLlama.lua must use the tested parser
+    -- Production wiring: SinglePhotoController uses the tested parser
     --------------------------------------------------------------------
     describe("production wiring", function()
-        it("uses Common.parseKeywordCsv and has no inline keyword parsing loop", function()
-            local source = assert(io.open(path .. "LrLlama.lua", "r")):read("*a")
+        it("SinglePhotoController uses common.parseKeywordCsv and has no inline parsing", function()
+            local source = assert(io.open(path .. "SinglePhotoController.lua", "r")):read("*a")
             assert.truthy(
-                string.find(source, "Common%.parseKeywordCsv"),
-                "LrLlama.lua should call Common.parseKeywordCsv"
+                string.find(source, "common%.parseKeywordCsv"),
+                "SinglePhotoController.lua should call common.parseKeywordCsv"
             )
+            assert.falsy(
+                string.find(source, "gmatch.*keywords.*%[%,", nil, true),
+                "SinglePhotoController.lua should not contain inline gmatch keyword parsing"
+            )
+        end)
+
+        it("LrLlama.lua has no inline keyword parsing loop", function()
+            local source = assert(io.open(path .. "LrLlama.lua", "r")):read("*a")
             assert.falsy(
                 string.find(source, "gmatch.*keywords.*%[%,", nil, true),
                 "LrLlama.lua should not contain inline gmatch keyword parsing"
