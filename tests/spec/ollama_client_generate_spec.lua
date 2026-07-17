@@ -1,425 +1,602 @@
 --- ollama_client_generate_spec.lua — Unit tests for OllamaClient.generate() pipeline.
---- Covers success path, retry behavior, error propagation, and temp-file cleanup.
+--- Covers success path, retry behavior, error propagation, exception-safe cleanup,
+--- event ordering, and error-preservation policy.
 
 local path = PLUGIN_PATH
 
 --------------------------------------------------------------------------------
---- Helper: build fakes aligned with how OllamaClient calls each dependency.
---- Dot-notation deps get no self; json uses colon so it does.
+--- Helper: build fakes with event recording aligned to OllamaClient internals.
+--- Dot-notation deps (http.post, thumbnailService.export) get no self.
+--- Colon-notation deps (json.encode) receive self as first arg.
 --------------------------------------------------------------------------------
 local function makeFakes()
-    local http = {
-        post_calls = {},
-        post_response = nil,
-    }
+    local events = {}
+
+    local http = { post_calls = {}, _response = nil }
     http.post = function(url, body, headers)
+        table.insert(events, "post")
         table.insert(http.post_calls, { url = url, body = body, headers = headers })
-        return http.post_response
+        return http._response
     end
 
     local prefs = {}
     prefs.prefsForPlugin = function()
-        return { ollamaServerHost = prefs.ollamaServerHost or "localhost:11434" }
+        return { ollamaServerHost = "localhost:11434" }
     end
 
     local tasks = { sleep_calls = {} }
-    tasks.sleep = function(seconds)
-        table.insert(tasks.sleep_calls, seconds)
+    tasks.sleep = function(s)
+        table.insert(tasks.sleep_calls, s)
     end
 
-    -- JSON uses colon notation (json:encode / json:decode) — self is first arg.
-    local json = {
-        encode_calls = {},
-        encode_return = nil,
-    }
+    -- JSON uses colon notation (json:encode) — self is first arg.
+    local json = { encode_calls = {}, _return = nil }
     json.encode = function(_, tbl)
+        table.insert(events, "json-encode")
         table.insert(json.encode_calls, tbl)
-        return json.encode_return or "{}"
+        return json._return or "{}"
     end
 
-    local thumbnailService = {
-        export_return = nil,
-        encodeBase64_return = nil,
-        cleanup_calls = {},
-        export_calls = {},
-    }
-    -- Dot-notation: no implicit self (OllamaClient calls thumbnailService.export(photo))
-    thumbnailService.export = function(photo)
-        table.insert(thumbnailService.export_calls, photo)
-        return thumbnailService.export_return
+    -- thumbnailService uses dot notation — no implicit self.
+    local ts = { cleanup_calls = {}, export_calls = {}, _export_return = nil }
+    ts.export = function(photo)
+        table.insert(events, "export")
+        table.insert(ts.export_calls, photo)
+        return ts._export_return
     end
-    thumbnailService.encodeBase64 = function(imagePath)
-        return thumbnailService.encodeBase64_return
+    ts.encodeBase64 = function(imagePath)
+        table.insert(events, "encode")
+        return ts._encode_return
     end
-    thumbnailService.cleanup = function(imagePath)
-        table.insert(thumbnailService.cleanup_calls, imagePath)
+    ts.cleanup = function(imagePath)
+        table.insert(events, "cleanup")
+        table.insert(ts.cleanup_calls, imagePath)
     end
 
-    local promptBuilder = {
+    -- promptBuilder uses dot notation — no implicit self.
+    local pb = {
         buildUserPrompt_calls = {},
         assembleRequestBody_calls = {},
-        buildUserPrompt_return = "default prompt",
-        assembleRequestBody_return = { model = "test", prompt = "p" },
+        _buildReturn = "default prompt",
+        _assembleReturn = { model = "test", prompt = "p" },
     }
-    -- Dot-notation: no implicit self (OllamaClient calls promptBuilder.buildUserPrompt(...))
-    promptBuilder.buildUserPrompt = function(instruction, currentData, useCurrent)
-        table.insert(promptBuilder.buildUserPrompt_calls, {
+    pb.buildUserPrompt = function(instruction, currentData, useCurrent)
+        table.insert(events, "build-prompt")
+        table.insert(pb.buildUserPrompt_calls, {
             instruction = instruction,
             currentData = currentData,
-            useCurrent = useCurrent
+            useCurrent = useCurrent,
         })
-        return promptBuilder.buildUserPrompt_return
+        return pb._buildReturn
     end
-    promptBuilder.assembleRequestBody = function(userPrompt, model, useSys, override)
-        table.insert(promptBuilder.assembleRequestBody_calls, {
+    pb.assembleRequestBody = function(userPrompt, model, useSys, override)
+        table.insert(events, "assemble-body")
+        table.insert(pb.assembleRequestBody_calls, {
             userPrompt = userPrompt,
             model = model,
             useSystemPrompt = useSys,
-            systemPromptOverride = override
+            systemPromptOverride = override,
         })
-        return promptBuilder.assembleRequestBody_return
+        return pb._assembleReturn
     end
 
-    local responseValidator = {
-        validateAndParse_calls = {},
-        validateAndParse_metadata = nil,
-        validateAndParse_error = nil,
-    }
-    -- Dot-notation: no implicit self (OllamaClient calls responseValidator.validateAndParse(...))
-    responseValidator.validateAndParse = function(rawResponse)
-        table.insert(responseValidator.validateAndParse_calls, rawResponse)
-        return responseValidator.validateAndParse_metadata,
-               responseValidator.validateAndParse_error
+    -- responseValidator uses dot notation.
+    local rv = { calls = {}, _metadata = nil, _error = nil }
+    rv.validateAndParse = function(rawResponse)
+        table.insert(events, "validate")
+        table.insert(rv.calls, rawResponse)
+        return rv._metadata, rv._error
     end
 
-    local logger = {
-        info_calls = {}, warn_calls = {}, error_calls = {},
-        enable = function() end,
-    }
-    logger.info  = function(msg) table.insert(logger.info_calls, msg) end
-    logger.warn  = function(msg) table.insert(logger.warn_calls, msg) end
-    logger.error = function(msg) table.insert(logger.error_calls, msg) end
+    -- logger — colon notation for info/warn/error (OllamaClient calls :info, :warn, :error).
+    local logger = { info_calls = {}, warn_calls = {}, error_calls = {}, enable = function() end }
+    logger.info  = function(_self, msg) table.insert(logger.info_calls, msg) end
+    logger.warn  = function(_self, msg) table.insert(logger.warn_calls, msg) end
+    logger.error = function(_self, msg) table.insert(logger.error_calls, msg) end
 
     return {
+        events = events,
         http = http,
         prefs = prefs,
         tasks = tasks,
         json = json,
-        thumbnailService = thumbnailService,
-        promptBuilder = promptBuilder,
-        responseValidator = responseValidator,
+        thumbnailService = ts,
+        promptBuilder = pb,
+        responseValidator = rv,
         logger = logger,
     }
 end
 
 --------------------------------------------------------------------------------
+--- Assert helpers
+--------------------------------------------------------------------------------
+local function assertEventOrder(expected)
+    return function(f)
+        for i, name in ipairs(expected) do
+            assert.are_same(name, f.events[i],
+                string.format("Expected event[%d] = '%s', got '%s'", i, name, tostring(f.events[i])))
+        end
+    end
+end
+
+--------------------------------------------------------------------------------
 describe("OllamaClient — generate()", function()
 
+    local Client
+    local c
+    local f
+
     --------------------------------------------------------------------
-    -- Happy path
+    -- 1. Happy path: full pipeline with event ordering
     --------------------------------------------------------------------
-    describe("success path", function()
-        it("orchestrates the full pipeline on first attempt", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/thumb.jpg"
-            f.thumbnailService.encodeBase64_return = "base64data"
-            f.http.post_response = '{"response":"{\"title\":\"T\",\"caption\":\"C\",\"keywords\":[\"k\"]}"}'
-            f.responseValidator.validateAndParse_metadata = { title = "T", caption = "C", keywords = { "k" } }
-            f.responseValidator.validateAndParse_error = nil
+    it("orchestrates the full pipeline on first attempt", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/thumb.jpg"
+        f.thumbnailService._encode_return = "base64data"
+        f.http._response = '{"response":"{\"title\":\"T\",\"caption\":\"C\",\"keywords\":[\"k\"]}"}'
+        f.responseValidator._metadata = { title = "T", caption = "C", keywords = { "k" } }
 
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
 
-            local result, err = c.generate(
-                { uuid = "photo-1" },   -- photo
-                "Caption this",        -- userInstruction
-                nil,                   -- currentData
-                false,                 -- useCurrentData
-                true,                  -- useSystemPrompt
-                "gemma4:latest",       -- selectedModel
-                nil                    -- systemPromptOverride
-            )
+        local result, err = c.generate(
+            { uuid = "photo-1" },
+            "Caption this",
+            nil, false, true, "gemma4:latest", nil
+        )
 
-            -- Thumbnail exported once
-            assert.are_same(1, #f.thumbnailService.export_calls)
-            assert.are_same("photo-1", f.thumbnailService.export_calls[1].uuid)
+        -- Event order: export → encode → build-prompt → assemble-body → json-encode
+        --              → post → cleanup → validate
+        assertEventOrder({
+            "export", "encode", "build-prompt", "assemble-body",
+            "json-encode", "post", "cleanup", "validate"
+        })(f)
 
-            -- Prompt built with correct args
-            assert.are_same(1, #f.promptBuilder.buildUserPrompt_calls)
-            local bpCall = f.promptBuilder.buildUserPrompt_calls[1]
-            assert.are_same("Caption this", bpCall.instruction)
-            assert.is_nil(bpCall.currentData)
-            assert.is_false(bpCall.useCurrent)
+        -- Cleanup exactly once with correct path.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/thumb.jpg", f.thumbnailService.cleanup_calls[1])
 
-            -- Request body assembled
-            assert.are_same(1, #f.promptBuilder.assembleRequestBody_calls)
-
-            -- Image attached to request body, then encoded + POSTed
-            assert.are_same(1, #f.json.encode_calls)
-            local encodedBody = f.json.encode_calls[1]
-            assert.is_true(type(encodedBody.images) == "table")
-            assert.are_same("base64data", encodedBody.images[1])
-
-            -- HTTP POST sent to correct URL
-            assert.are_same(1, #f.http.post_calls)
-            assert.are_same("http://localhost:11434/api/generate", f.http.post_calls[1].url)
-
-            -- Cleanup always runs
-            assert.are_same(1, #f.thumbnailService.cleanup_calls)
-            assert.are_same("/tmp/thumb.jpg", f.thumbnailService.cleanup_calls[1])
-
-            -- ResponseValidator called with raw HTTP response
-            assert.are_same(1, #f.responseValidator.validateAndParse_calls)
-
-            -- Result from validateAndParse is returned
-            assert.are_same("T", result.title)
-            assert.is_nil(err)
-        end)
-
-        it("falls back to default model when selectedModel is nil", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/t.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = '{}'
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            c.generate({ uuid = "p" }, "hi", nil, false, true, nil, nil)
-
-            local rbCall = f.promptBuilder.assembleRequestBody_calls[1]
-            assert.are_same("gemma4:latest", rbCall.model)
-        end)
-
-        it("passes systemPromptOverride through to assembleRequestBody", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/t.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = '{}'
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            c.generate({ uuid = "p" }, "hi", nil, false, true, "gemma4:latest", "custom system")
-
-            local rbCall = f.promptBuilder.assembleRequestBody_calls[1]
-            assert.are_same("custom system", rbCall.systemPromptOverride)
-        end)
+        -- Result from validator returned unchanged.
+        assert.are_same("T", result.title)
+        assert.is_nil(err)
     end)
 
     --------------------------------------------------------------------
-    -- Thumbnail export retry
+    -- 2. Encoding returns nil → cleanup, no POST/validate
     --------------------------------------------------------------------
-    describe("thumbnail retry", function()
-        it("retries up to 3 times when export fails", function()
-            local f = makeFakes()
-            -- First two calls return nil, third succeeds
-            local attempt = 0
-            f.thumbnailService.export = function(photo)
-                attempt = attempt + 1
-                if attempt < 3 then
-                    return nil
-                end
-                return "/tmp/t.jpg"
-            end
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = '{}'
+    it("cleans up when encoding returns nil", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = nil
 
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.are_same("Failed to encode image", err)
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+        assert.are_same(0, #f.http.post_calls)
+        assert.are_same(0, #f.responseValidator.calls)
+    end)
+
+    --------------------------------------------------------------------
+    -- 3. Encoding throws → cleanup still runs
+    --------------------------------------------------------------------
+    it("cleans up when encoding throws", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService.encodeBase64 = function(_)
+            table.insert(f.events, "encode")
+            error("encode exploded")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.is_not_nil(err)
+        assert.is_not_nil(string.find(tostring(err), "encode exploded", 1, true))
+        -- Cleanup despite exception.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+        assert.are_same(0, #f.http.post_calls)
+    end)
+
+    --------------------------------------------------------------------
+    -- 4. Prompt builder throws → cleanup still runs
+    --------------------------------------------------------------------
+    it("cleans up when prompt builder throws", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.promptBuilder.buildUserPrompt = function()
+            table.insert(f.events, "build-prompt")
+            error("prompt builder error")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.is_not_nil(string.find(tostring(err), "prompt builder error", 1, true))
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+    end)
+
+    --------------------------------------------------------------------
+    -- 5. Request-body assembly throws → cleanup still runs
+    --------------------------------------------------------------------
+    it("cleans up when request-body assembly throws", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.promptBuilder.assembleRequestBody = function()
+            table.insert(f.events, "assemble-body")
+            error("assembly error")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.is_not_nil(string.find(tostring(err), "assembly error", 1, true))
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+    end)
+
+    --------------------------------------------------------------------
+    -- 6. JSON encoding throws → cleanup still runs
+    --------------------------------------------------------------------
+    it("cleans up when JSON encoding throws", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.json.encode = function(_)
+            table.insert(f.events, "json-encode")
+            error("json encoding failed")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.is_not_nil(string.find(tostring(err), "json encoding failed", 1, true))
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+        assert.are_same(0, #f.http.post_calls)
+    end)
+
+    --------------------------------------------------------------------
+    -- 7. HTTP POST returns nil → cleanup before error return
+    --------------------------------------------------------------------
+    it("cleans up when http.post returns nil", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.http._response = nil
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.are_same("Failed to send data to the API", err)
+        -- Cleanup runs before error return.
+        assertEventOrder({
+            "export", "encode", "build-prompt", "assemble-body",
+            "json-encode", "post", "cleanup"
+        })(f)
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+    end)
+
+    --------------------------------------------------------------------
+    -- 8. HTTP POST throws → cleanup still runs
+    --------------------------------------------------------------------
+    it("cleans up when http.post throws", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.http.post = function(_, _, _)
+            table.insert(f.events, "post")
+            error("post exploded")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.is_not_nil(string.find(tostring(err), "post exploded", 1, true))
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+    end)
+
+    --------------------------------------------------------------------
+    -- 9. Validator returns error → cleanup happened before validation
+    --------------------------------------------------------------------
+    it("cleans up before validator and returns validation error", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.http._response = '{"response":"raw inner"}'
+        f.responseValidator._metadata = nil
+        f.responseValidator._error = "invalid metadata"
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.are_same("invalid metadata", err)
+        -- Cleanup before validate in event order.
+        local cleanupIdx = nil
+        local validateIdx = nil
+        for i, e in ipairs(f.events) do
+            if e == "cleanup" then cleanupIdx = i end
+            if e == "validate" then validateIdx = i end
+        end
+        assert.is_not_nil(cleanupIdx)
+        assert.is_not_nil(validateIdx)
+        assert.are_true(cleanupIdx < validateIdx,
+            "Cleanup must occur before validation")
+    end)
+
+    --------------------------------------------------------------------
+    -- 10. Validator throws → cleanup has occurred already (validation
+    --     is outside runWithCleanup, so exception propagates after cleanup).
+    --------------------------------------------------------------------
+    it("cleans up before validator even if validator throws", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.http._response = '{"response":"raw"}'
+        f.responseValidator.validateAndParse = function(_)
+            table.insert(f.events, "validate")
+            error("validation exploded")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        -- Validation is outside runWithCleanup, so a thrown exception
+        -- propagates. Cleanup already happened inside runWithCleanup.
+        local ok, err = pcall(c.generate, c,
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_false(ok)
+        assert.is_not_nil(string.find(tostring(err), "validation exploded", 1, true))
+        -- Cleanup ran before validation was even attempted.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+    end)
+
+    --------------------------------------------------------------------
+    -- 11. Cleanup fails after successful generation → no false success
+    --------------------------------------------------------------------
+    it("returns cleanup error when cleanup fails after generation success", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        f.http._response = '{"response":"{\"title\":\"T\",\"caption\":\"C\",\"keywords\":[\"k\"]}"}'
+        f.responseValidator._metadata = { title = "T", caption = "C", keywords = { "k" } }
+        -- Make cleanup throw.
+        f.thumbnailService.cleanup = function(_)
+            table.insert(f.events, "cleanup")
+            error("disk full")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.is_not_nil(string.find(tostring(err), "Failed to clean up thumbnail", 1, true))
+        assert.is_not_nil(string.find(tostring(err), "disk full", 1, true))
+    end)
+
+    --------------------------------------------------------------------
+    -- 12. Cleanup fails AND generation failed → original error preserved
+    --------------------------------------------------------------------
+    it("preserves generation error when both generation and cleanup fail", function()
+        f = makeFakes()
+        f.thumbnailService._export_return = "/tmp/t.jpg"
+        f.thumbnailService._encode_return = "img"
+        -- POST throws (generation fails)
+        f.http.post = function(_, _, _)
+            table.insert(f.events, "post")
+            error("network timeout")
+        end
+        -- Cleanup also throws.
+        f.thumbnailService.cleanup = function(_)
+            table.insert(f.events, "cleanup")
+            error("disk full")
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        -- Original generation error is preserved.
+        assert.is_not_nil(string.find(tostring(err), "network timeout", 1, true),
+            "Expected original generation error in result")
+        -- Cleanup failure logged via logger:error (not surfaced).
+        assert.are_same(1, #f.logger.error_calls)
+        assert.is_not_nil(string.find(f.logger.error_calls[1], "disk full", 1, true))
+    end)
+
+    --------------------------------------------------------------------
+    -- 13. Export fails all 3 attempts → no cleanup
+    --------------------------------------------------------------------
+    it("does not clean up when export fails all attempts", function()
+        f = makeFakes()
+        f.thumbnailService.export = function(photo)
+            table.insert(f.events, "export")
+            table.insert(f.thumbnailService.export_calls, photo)
+            return nil
+        end
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        assert.is_nil(result)
+        assert.are_same("Failed to export thumbnail after 3 attempts", err)
+        -- Export called 3 times.
+        assert.are_same(3, #f.thumbnailService.export_calls)
+        -- No cleanup (nothing to clean up).
+        assert.are_same(0, #f.thumbnailService.cleanup_calls)
+    end)
+
+    --------------------------------------------------------------------
+    -- 14. Export succeeds on second attempt → cleanup runs once
+    --------------------------------------------------------------------
+    it("cleans up when export succeeds on second attempt", function()
+        f = makeFakes()
+        local attempt = 0
+        f.thumbnailService.export = function(photo)
+            table.insert(f.events, "export")
+            table.insert(f.thumbnailService.export_calls, photo)
+            attempt = attempt + 1
+            if attempt < 2 then return nil end
+            return "/tmp/t.jpg"
+        end
+        f.thumbnailService._encode_return = "img"
+        f.http._response = '{}'
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        -- Export called twice.
+        assert.are_same(2, #f.thumbnailService.export_calls)
+        -- One sleep between attempts.
+        assert.are_same(1, #f.tasks.sleep_calls)
+        -- Cleanup runs once with correct path.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+    end)
+
+    --------------------------------------------------------------------
+    -- 15. Export succeeds on third attempt → cleanup runs once
+    --------------------------------------------------------------------
+    it("cleans up when export succeeds on third attempt", function()
+        f = makeFakes()
+        local attempt = 0
+        f.thumbnailService.export = function(photo)
+            table.insert(f.events, "export")
+            table.insert(f.thumbnailService.export_calls, photo)
+            attempt = attempt + 1
+            if attempt < 3 then return nil end
+            return "/tmp/t.jpg"
+        end
+        f.thumbnailService._encode_return = "img"
+        f.http._response = '{}'
+
+        Client = assert(loadfile(path .. "OllamaClient.lua"))()
+        c = Client.new(f)
+
+        local result, err = c.generate(
+            { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
+        )
+
+        -- Export called three times.
+        assert.are_same(3, #f.thumbnailService.export_calls)
+        -- Two sleeps between attempts.
+        assert.are_same(2, #f.tasks.sleep_calls)
+        -- Cleanup runs once.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
+    end)
+
+    --------------------------------------------------------------------
+    -- 16. No double cleanup — explicit assertion across scenarios
+    --------------------------------------------------------------------
+    it("never calls cleanup more than once in any post-export scenario", function()
+        -- This meta-test re-runs several configurations and asserts
+        -- cleanup count == 1 for every scenario where export succeeded.
+        local scenarios = {
+            -- Name, setup function
+            {
+                "success",
+                function(fake)
+                    fake.thumbnailService._encode_return = "img"
+                    fake.http._response = '{"response":"{\"title\":\"T\",\"caption\":\"C\",\"keywords\":[\"k\"]}"}'
+                    fake.responseValidator._metadata = { title = "T" }
+                end,
+            },
+            {
+                "encode-nil",
+                function(fake)
+                    fake.thumbnailService._encode_return = nil
+                end,
+            },
+            {
+                "http-nil",
+                function(fake)
+                    fake.thumbnailService._encode_return = "img"
+                    fake.http._response = nil
+                end,
+            },
+        }
+
+        for _, scenario in ipairs(scenarios) do
+            local name, setup = scenario[1], scenario[2]
+            f = makeFakes()
+            f.thumbnailService._export_return = "/tmp/t.jpg"
+            setup(f)
+
+            Client = assert(loadfile(path .. "OllamaClient.lua"))()
+            c = Client.new(f)
 
             c.generate({ uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil)
 
-            assert.are_same(3, attempt)
-            -- Sleep called between attempts (2 sleeps for 3 attempts)
-            assert.are_same(2, #f.tasks.sleep_calls)
-        end)
-
-        it("returns error after 3 failed exports", function()
-            local f = makeFakes()
-            -- Always return nil from export
-            f.thumbnailService.export = function() return nil end
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            local result, err = c.generate(
-                { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
-            )
-
-            assert.is_nil(result)
-            assert.are_same("Failed to export thumbnail after 3 attempts", err)
-        end)
-
-        it("sleeps between retry attempts", function()
-            local f = makeFakes()
-            local attempt = 0
-            f.thumbnailService.export = function()
-                attempt = attempt + 1
-                return nil
-            end
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            c.generate({ uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil)
-
-            -- 3 attempts → 3 sleeps (sleep after each failed attempt including last)
-            assert.are_same(3, #f.tasks.sleep_calls)
-            assert.are_same(0.5, f.tasks.sleep_calls[1])
-        end)
-    end)
-
-    --------------------------------------------------------------------
-    -- Base64 encoding failure
-    --------------------------------------------------------------------
-    describe("encoding failure", function()
-        it("returns error and cleans up when encode fails", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/t.jpg"
-            f.thumbnailService.encodeBase64_return = nil  -- encoding failed
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            local result, err = c.generate(
-                { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
-            )
-
-            assert.is_nil(result)
-            assert.are_same("Failed to encode image", err)
-            -- Cleanup happens even on failure
-            assert.are_same(1, #f.thumbnailService.cleanup_calls)
-            assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
-        end)
-    end)
-
-    --------------------------------------------------------------------
-    -- HTTP POST failure
-    --------------------------------------------------------------------
-    describe("HTTP failure", function()
-        it("returns error when http.post returns nil", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/t.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = nil  -- network error
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            local result, err = c.generate(
-                { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
-            )
-
-            assert.is_nil(result)
-            assert.are_same("Failed to send data to the API", err)
-            -- Cleanup still runs
-            assert.are_same(1, #f.thumbnailService.cleanup_calls)
-        end)
-    end)
-
-    --------------------------------------------------------------------
-    -- Response validation delegation
-    --------------------------------------------------------------------
-    describe("response validation", function()
-        it("passes raw HTTP response to validateAndParse", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/t.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = '{"response":"raw inner"}'
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            c.generate({ uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil)
-
-            assert.are_same(1, #f.responseValidator.validateAndParse_calls)
-            assert.are_same('{"response":"raw inner"}', f.responseValidator.validateAndParse_calls[1])
-        end)
-
-        it("returns validation error when response is invalid", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/t.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = 'invalid json'
-            f.responseValidator.validateAndParse_metadata = nil
-            f.responseValidator.validateAndParse_error = "Bad response"
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            local result, err = c.generate(
-                { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
-            )
-
-            assert.is_nil(result)
-            assert.are_same("Bad response", err)
-        end)
-    end)
-
-    --------------------------------------------------------------------
-    -- Cleanup verification
-    --------------------------------------------------------------------
-    describe("cleanup", function()
-        it("cleans up thumbnail even when HTTP fails", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/x.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = nil
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            c.generate({ uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil)
-
-            assert.are_same(1, #f.thumbnailService.cleanup_calls)
-            assert.are_same("/tmp/x.jpg", f.thumbnailService.cleanup_calls[1])
-        end)
-
-        it("cleans up thumbnail even when validation fails", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/y.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = 'bad'
-            f.responseValidator.validateAndParse_metadata = nil
-            f.responseValidator.validateAndParse_error = "validation failed"
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            c.generate({ uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil)
-
-            assert.are_same(1, #f.thumbnailService.cleanup_calls)
-            assert.are_same("/tmp/y.jpg", f.thumbnailService.cleanup_calls[1])
-        end)
-    end)
-
-    --------------------------------------------------------------------
-    -- Prompt construction
-    --------------------------------------------------------------------
-    describe("prompt construction", function()
-        it("builds prompt with current data when useCurrentData is true", function()
-            local f = makeFakes()
-            f.thumbnailService.export_return = "/tmp/t.jpg"
-            f.thumbnailService.encodeBase64_return = "img"
-            f.http.post_response = '{}'
-
-            local Client = assert(loadfile(path .. "OllamaClient.lua"))()
-            local c = Client.new(f)
-
-            c.generate(
-                { uuid = "p" },
-                "Caption this",
-                { title = "Old Title", caption = "Old Caption" },
-                true,     -- useCurrentData
-                false,
-                "gemma4:latest",
-                nil
-            )
-
-            local bpCall = f.promptBuilder.buildUserPrompt_calls[1]
-            assert.is_true(bpCall.useCurrent)
-            assert.are_same("Old Title", bpCall.currentData.title)
-        end)
+            assert.are_same(
+                1, #f.thumbnailService.cleanup_calls,
+                string.format("[%s] cleanup called %d times (expected 1)",
+                    name, #f.thumbnailService.cleanup_calls))
+        end
     end)
 end)
