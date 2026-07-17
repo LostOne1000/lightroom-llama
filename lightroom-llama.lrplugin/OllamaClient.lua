@@ -23,56 +23,21 @@ local ResponseValidator = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "Resp
 --- Helpers for exception-safe cleanup
 --------------------------------------------------------------------------------
 
---- Pack variadic returns preserving nil positions (Lua 5.1 compatible).
----@return table results Table with `.n` count and packed values
-local function pack(...)
-    return { n = select("#", ...), ... }
-end
-
--- Lua 5.1: unpack is a global; Lua 5.2+: it moved to table.unpack.
-local unpack = unpack or table.unpack
-
---- Run *operation* under pcall, then always attempt *cleanupFn*.
---- Guarantees the temp thumbnail is deleted regardless of how the
---- generation pipeline exits (success, returned failure, or exception).
----
---- Error preservation:
----   - Generation fails + cleanup succeeds → return original error
----   - Generation fails + cleanup fails    → return original error; log cleanup
----   - Generation succeeds + cleanup fails → return cleanup error (no false success)
---- The `results` table is filled by `pack()` inside pcall so multiple return
---- values from the operation survive the protected call.
+--- Run *operation*, then always attempt *cleanupFn*.
+--- Does NOT use pcall — Lightroom's LrTasks.startAsyncTask already runs
+--- in a protected context, and nesting pcall inside that context prevents
+--- SDK functions (http.post, encodeBase64, etc.) from yielding to the
+--- Lightroom event loop, causing "Yielding is not allowed" errors.
+--- Cleanup always runs after the operation so the temp thumbnail is removed
+--- before validation or error propagation.
 ---@param thumbnailPath string  Path to delete after operation
----@param operation function    Generation logic returning zero or more values
+---@param operation function    Generation logic returning (result, error)
 ---@param cleanupFn function   Cleanup function accepting the path
----@param activeLogger table   Logger for dual-failure diagnostics
----@return ... The return values of *operation* on success, or `nil, error` on failure
-local function runWithCleanup(thumbnailPath, operation, cleanupFn, activeLogger)
-    local results = { n = 0 }
-
-    local ok, errInfo = pcall(function()
-        results = pack(operation())
-    end)
-
-    -- Always attempt cleanup regardless of operation outcome.
-    local cleanupOk, cleanupErr = pcall(cleanupFn, thumbnailPath)
-
-    if not ok then
-        -- Generation threw an exception.
-        if not cleanupOk then
-            activeLogger:error(
-                "Thumbnail cleanup also failed: " .. tostring(cleanupErr)
-            )
-        end
-        return nil, errInfo
-    end
-
-    -- Generation succeeded but cleanup failed — do not report success.
-    if not cleanupOk then
-        return nil, "Failed to clean up thumbnail: " .. tostring(cleanupErr)
-    end
-
-    return unpack(results, 1, results.n)
+---@return ... The return values of *operation*
+local function runWithCleanup(thumbnailPath, operation, cleanupFn)
+    local result, err = operation()
+    cleanupFn(thumbnailPath)
+    return result, err
 end
 
 --------------------------------------------------------------------------------
@@ -358,8 +323,7 @@ local function createClient(deps)
                                    useCurrentData, useSystemPrompt, selectedModel,
                                    systemPromptOverride)
             end,
-            function(path) thumbnailService.cleanup(path) end,
-            activeLogger
+            function(path) thumbnailService.cleanup(path) end
         )
 
         -- If POST/cleanup failed, return immediately.
