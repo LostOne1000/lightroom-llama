@@ -1,0 +1,49 @@
+name: Package release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, package, and draft release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out tagged commit
+        uses: actions/checkout@v6
+
+      - name: Install Lua 5.1.5
+        uses: leafo/gh-actions-lua@v13
+        with:
+          luaVersion: "5.1.5"
+
+      - name: Install LuaRocks
+        uses: leafo/gh-actions-luarocks@v6
+
+      - name: Install Busted
+        run: luarocks install busted 2.3.0-1
+
+      - name: Derive version from tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "PACKAGE=dist/lightroom-llama-v${VERSION}.zip" >> "$GITHUB_ENV"
+
+      - name: Build release package
+        run: make package VERSION="$VERSION"
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$PACKAGE" \
+            --verify-tag \
+            --draft \
+            --generate-notes \
+            --title "Lightroom Llama $VERSION"
