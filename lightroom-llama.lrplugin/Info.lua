@@ -5,10 +5,10 @@ return {
         revision = 0
     },
     LrPluginName = "Lightroom Llama",
-    LrPluginDescription = "Description of your Lightroom plugin",
+    LrPluginDescription = "Generate titles, captions, and organized keywords for photos using Ollama models directly from Lightroom Classic.",
     LrToolkitIdentifier = "com.thejoltjoker.lightroom.llama",
-    LrPluginInfoUrl = "https://github.com/thejoltjoker/lightroom-llama",
-    LrPluginInfoUrlProvider = "http://www.thejoltjoker.com",
+    LrPluginInfoUrl = "https://github.com/LostOne1000/lightroom-llama",
+    LrPluginInfoUrlProvider = "https://github.com/LostOne1000",
     LrSdkVersion = 10.0,
     LrSdkMinimumVersion = 5.0,
     LrLibraryMenuItems = {{

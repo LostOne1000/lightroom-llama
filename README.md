@@ -60,7 +60,7 @@
 
 ### Installation
 
-1. Clone or download the latest version of Lightroom Llama from [here](https://github.com/thejoltjoker/lightroom-llama).
+1. Clone or download the latest version of Lightroom Llama from [here](https://github.com/LostOne1000/lightroom-llama).
 2. Open Adobe Lightroom Classic
 3. Go to File > Plug-in Manager
 4. Click the "Add" button in the bottom left
@@ -78,7 +78,7 @@
 2. Install [Homebrew](https://brew.sh/) if you don't have it already
    1. `/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"`
 3. `brew install ollama`
-4. `ollama run minicpm-v` (Supports localhost only currently).
+4. `ollama run minicpm-v`
 
 For latest instructions on how to install and run Ollama, see [here](https://github.com/ollama/ollama).
 
@@ -117,11 +117,10 @@ The plugin adds three menu items under **Library > Plug-in Extras** and **File >
 ## TODO
 
 - [x] Add support for more LLM models - queries Ollama to populate a list of models.
-- [ ] Add support for remote LLM models via server address entry
+- [x] Add support for remote LLM models via server address entry
 - [x] Implement batch processing for multiple photos
 - [ ] Add customizable prompt templates
 - [ ] Create settings panel for model configuration
-- [ ] Add customizable prompt templates
 - [ ] Implement keyword import/export functionality
 - [ ] Add support for different image formats
 - [ ] Create batch processing presets
