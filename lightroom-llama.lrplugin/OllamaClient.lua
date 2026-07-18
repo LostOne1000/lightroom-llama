@@ -20,27 +20,6 @@ local PromptBuilder = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "PromptBu
 local ResponseValidator = (assert(loadfile(LrPathUtils.child(_PLUGIN.path, "ResponseValidator.lua"))))()
 
 --------------------------------------------------------------------------------
---- Helpers for exception-safe cleanup
---------------------------------------------------------------------------------
-
---- Run *operation*, then always attempt *cleanupFn*.
---- Does NOT use pcall — Lightroom's LrTasks.startAsyncTask already runs
---- in a protected context, and nesting pcall inside that context prevents
---- SDK functions (http.post, encodeBase64, etc.) from yielding to the
---- Lightroom event loop, causing "Yielding is not allowed" errors.
---- Cleanup always runs after the operation so the temp thumbnail is removed
---- before validation or error propagation.
----@param thumbnailPath string  Path to delete after operation
----@param operation function    Generation logic returning (result, error)
----@param cleanupFn function   Cleanup function accepting the path
----@return ... The return values of *operation*
-local function runWithCleanup(thumbnailPath, operation, cleanupFn)
-    local result, err = operation()
-    cleanupFn(thumbnailPath)
-    return result, err
-end
-
---------------------------------------------------------------------------------
 --- Constructor — create a client with injectable dependencies.
 --- callers need no changes while tests can provide lightweight fakes.
 ---@param deps table|nil Optional dependency overrides:
@@ -243,58 +222,37 @@ local function createClient(deps)
         return nil
     end
 
-    --- Execute the HTTP POST step: encode, build prompt, assemble body, send request.
-    --- Returns the raw HTTP response string (or nil on failure). Cleanup is NOT
-    --- performed here — it is the responsibility of `runWithCleanup`.
-    ---@param thumbnailPath string Path to exported JPEG
-    ---@param userInstruction string User-facing prompt text
-    ---@param currentData table|nil Existing title/caption
-    ---@param useCurrentData boolean Include current metadata in prompt
-    ---@param useSystemPrompt boolean Send system prompt
-    ---@param selectedModel string|nil Model name
-    ---@param systemPromptOverride string|nil Custom system prompt
-    ---@return string|nil rawResponse HTTP response body, or nil
-    ---@return string|nil err Error message
-    local function executePost(thumbnailPath, userInstruction, currentData,
-                               useCurrentData, useSystemPrompt, selectedModel,
-                               systemPromptOverride)
-        -- Encode image as Base64
-        local encodedImage = thumbnailService.encodeBase64(thumbnailPath)
-        if not encodedImage then
-            return nil, "Failed to encode image"
+    --- Best-effort helper: attempt to clean up the thumbnail and log any failure.
+    --- Returns true if cleanup succeeded, false if logged.
+    --- LrFileUtils.delete is a local-disk operation — it does not yield, so
+    --- pcall here is safe (avoids the "yield through protected boundary" issue
+    --- that plagues network I/O).
+    ---@param path string Path to delete
+    ---@return bool succeeded  True if cleanup completed without error
+    local function tryCleanup(path)
+        local ok, err = pcall(function() thumbnailService.cleanup(path) end)
+        if not ok and activeLogger then
+            activeLogger:error(
+                "Thumbnail cleanup also failed: " .. tostring(err)
+            )
         end
-
-        -- Build user prompt and request body
-        local builtPrompt = promptBuilder.buildUserPrompt(userInstruction, currentData, useCurrentData)
-        local requestBody = promptBuilder.assembleRequestBody(
-            builtPrompt, selectedModel or client.defaultModel,
-            useSystemPrompt, systemPromptOverride
-        )
-        requestBody.images = {encodedImage}
-
-        -- Send HTTP POST
-        local url = client.getBaseUrl(prefsService.prefsForPlugin()) .. "/api/generate"
-        local jsonPayload = json:encode(requestBody)
-
-        local response = http.post(url, jsonPayload, {{
-            field = "Content-Type",
-            value = "application/json"
-        }})
-
-        if not response then
-            return nil, "Failed to send data to the API"
-        end
-
-        -- Return raw response for validation (after cleanup in caller).
-        return response, nil
+        return ok
     end
 
-    --- High-level generate: export thumbnail, encode, build prompt, POST, validate response.
+    --- High-level generate: export thumbnail, encode, build prompt, POST, validate.
     --- Orchestrates ThumbnailService + PromptBuilder + ResponseValidator internally.
     --- This is the decomposition of the former Common.sendDataToApi mega-function.
-    --- Retries thumbnail export up to 3 times. Cleans up the temp file after the
-    --- HTTP request regardless of success or failure (even when downstream code throws).
-    --- Validation runs after cleanup so the thumbnail is always removed first.
+    --- Retries thumbnail export up to 3 times. Cleans up the temp file at every
+    --- exit point regardless of success or failure.
+    ---
+    --- Explicit cleanup (rather than wrapping SDK calls in pcall) avoids the
+    --- "yield through protected boundary" problem: Lightroom SDK functions like
+    --- http.post and LrStringUtils.encodeBase64 can yield internally, and pcall
+    --- cannot survive those yields — it returns early with a false error, silently
+    --- swallowing the real result. Explicit cleanup at each step is equally safe
+    --- for return-based failures and avoids the yield problem entirely.
+    --- Pure-Lua steps (prompt builder, JSON encoding) are still wrapped in pcall
+    --- because they cannot yield.
    ---@param photo LrPhoto Photo object from the catalog
    ---@param userInstruction string User-facing prompt text
    ---@param currentData table|nil Existing title/caption to prepend when useCurrentData is true
@@ -314,25 +272,52 @@ local function createClient(deps)
             return nil, "Failed to export thumbnail after 3 attempts"
         end
 
-        -- Run the HTTP POST under exception-safe cleanup: thumbnail is deleted after
-        -- the request regardless of success or exception.
-        local rawResponse, err = runWithCleanup(
-            thumbnailPath,
-            function()
-                return executePost(thumbnailPath, userInstruction, currentData,
-                                   useCurrentData, useSystemPrompt, selectedModel,
-                                   systemPromptOverride)
-            end,
-            function(path) thumbnailService.cleanup(path) end
-        )
-
-        -- If POST/cleanup failed, return immediately.
-        if not rawResponse then
-            return nil, err
+        -- Step 1: Encode image as Base64 (SDK — may yield, don't wrap in pcall).
+        local encodedImage = thumbnailService.encodeBase64(thumbnailPath)
+        if not encodedImage then
+            tryCleanup(thumbnailPath)
+            return nil, "Failed to encode image"
         end
 
-        -- Validate after cleanup so the thumbnail is always removed first.
-        return responseValidator.validateAndParse(rawResponse)
+        -- Step 2: Build prompt, assemble body, JSON-encode (pure Lua — pcall-safe).
+        local jsonPayload
+        local ok, err = pcall(function()
+            local builtPrompt = promptBuilder.buildUserPrompt(
+                userInstruction, currentData, useCurrentData)
+            local requestBody = promptBuilder.assembleRequestBody(
+                builtPrompt, selectedModel or client.defaultModel,
+                useSystemPrompt, systemPromptOverride)
+            requestBody.images = {encodedImage}
+            jsonPayload = json:encode(requestBody)
+        end)
+        if not ok then
+            tryCleanup(thumbnailPath)
+            return nil, tostring(err)
+        end
+
+        -- Step 3: HTTP POST (SDK — may yield, don't wrap in pcall).
+        local url = client.getBaseUrl(prefsService.prefsForPlugin()) .. "/api/generate"
+        local response = http.post(url, jsonPayload, {{
+            field = "Content-Type",
+            value = "application/json"
+        }})
+        if not response then
+            tryCleanup(thumbnailPath)
+            return nil, "Failed to send data to the API"
+        end
+
+        -- Step 4: Cleanup thumbnail before validation — even on success.
+        -- LrFileUtils.delete is local-disk I/O (no yield), so pcall is safe.
+        -- If cleanup fails here, no point validating — return the cleanup error.
+        local cleanupOk, cleanupErr = pcall(function()
+            thumbnailService.cleanup(thumbnailPath)
+        end)
+        if not cleanupOk then
+            return nil, "Failed to clean up thumbnail: " .. tostring(cleanupErr)
+        end
+
+        -- Step 5: Validate after cleanup — thumbnail removed regardless of outcome.
+        return responseValidator.validateAndParse(response)
     end
 
     return client

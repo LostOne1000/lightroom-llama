@@ -185,13 +185,11 @@ describe("OllamaClient — generate()", function()
     end)
 
     --------------------------------------------------------------------
-    -- 3. Encoding throws → exception propagates (no pcall in Lightroom).
-    --    In production, SDK functions return nil on error rather than
-    --    throwing, so this path is defensive-only. Tests catch with
-    --    pcall at the test level since cleanup cannot run when an
-    --    intermediate step throws without protected calls.
+    -- 3. Encoding throws → SDK crashes propagate (no pcall around
+    --     yielding SDK functions). Cleanup is a best-effort trade-off:
+    --     normal nil-returns trigger cleanup; true SDK crashes do not.
     --------------------------------------------------------------------
-    it("propagates exceptions from encoding", function()
+    it("propagates when encoding SDK function throws", function()
         f = makeFakes()
         f.thumbnailService._export_return = "/tmp/t.jpg"
         f.thumbnailService.encodeBase64 = function(_)
@@ -202,21 +200,22 @@ describe("OllamaClient — generate()", function()
         Client = assert(loadfile(path .. "OllamaClient.lua"))()
         c = Client.new(f)
 
+        -- SDK throws propagate because we avoid wrapping yielding SDK calls in pcall.
         local ok, err = pcall(c.generate, c,
             { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
         )
 
         assert.is_false(ok)
         assert.is_not_nil(string.find(tostring(err), "encode exploded", 1, true))
-        -- Note: cleanup cannot run when intermediate steps throw
-        -- without pcall (which Lightroom's sandbox doesn't support).
+        -- Cleanup cannot run when SDK functions throw — acceptable trade-off
+        -- that avoids the "yield through protected boundary" problem.
         assert.are_same(0, #f.http.post_calls)
     end)
 
     --------------------------------------------------------------------
-    -- 4. Prompt builder throws → same propagation behavior.
+    -- 4. Prompt builder throws → cleanup runs, error returned.
     --------------------------------------------------------------------
-    it("propagates exceptions from prompt builder", function()
+    it("cleans up when prompt builder throws", function()
         f = makeFakes()
         f.thumbnailService._export_return = "/tmp/t.jpg"
         f.thumbnailService._encode_return = "img"
@@ -228,18 +227,21 @@ describe("OllamaClient — generate()", function()
         Client = assert(loadfile(path .. "OllamaClient.lua"))()
         c = Client.new(f)
 
-        local ok, err = pcall(c.generate, c,
+        local result, err = c.generate(
             { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
         )
 
-        assert.is_false(ok)
+        assert.is_nil(result)
         assert.is_not_nil(string.find(tostring(err), "prompt builder error", 1, true))
+        -- Cleanup runs despite exception.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
     end)
 
     --------------------------------------------------------------------
-    -- 5. Request-body assembly throws → same propagation behavior.
+    -- 5. Request-body assembly throws → cleanup runs, error returned.
     --------------------------------------------------------------------
-    it("propagates exceptions from request-body assembly", function()
+    it("cleans up when request-body assembly throws", function()
         f = makeFakes()
         f.thumbnailService._export_return = "/tmp/t.jpg"
         f.thumbnailService._encode_return = "img"
@@ -251,18 +253,21 @@ describe("OllamaClient — generate()", function()
         Client = assert(loadfile(path .. "OllamaClient.lua"))()
         c = Client.new(f)
 
-        local ok, err = pcall(c.generate, c,
+        local result, err = c.generate(
             { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
         )
 
-        assert.is_false(ok)
+        assert.is_nil(result)
         assert.is_not_nil(string.find(tostring(err), "assembly error", 1, true))
+        -- Cleanup runs despite exception.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
     end)
 
     --------------------------------------------------------------------
-    -- 6. JSON encoding throws → same propagation behavior.
+    -- 6. JSON encoding throws → cleanup runs, error returned.
     --------------------------------------------------------------------
-    it("propagates exceptions from JSON encoding", function()
+    it("cleans up when JSON encoding throws", function()
         f = makeFakes()
         f.thumbnailService._export_return = "/tmp/t.jpg"
         f.thumbnailService._encode_return = "img"
@@ -274,12 +279,15 @@ describe("OllamaClient — generate()", function()
         Client = assert(loadfile(path .. "OllamaClient.lua"))()
         c = Client.new(f)
 
-        local ok, err = pcall(c.generate, c,
+        local result, err = c.generate(
             { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
         )
 
-        assert.is_false(ok)
+        assert.is_nil(result)
         assert.is_not_nil(string.find(tostring(err), "json encoding failed", 1, true))
+        -- Cleanup runs despite exception.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        assert.are_same("/tmp/t.jpg", f.thumbnailService.cleanup_calls[1])
         assert.are_same(0, #f.http.post_calls)
     end)
 
@@ -310,9 +318,10 @@ describe("OllamaClient — generate()", function()
     end)
 
     --------------------------------------------------------------------
-    -- 8. HTTP POST throws → exception propagates (same as above).
+    -- 8. HTTP POST throws → SDK crashes propagate (no pcall around
+    --     yielding SDK functions). Cleanup is best-effort for SDK crashes.
     --------------------------------------------------------------------
-    it("propagates exceptions from http.post", function()
+    it("propagates when http.post throws", function()
         f = makeFakes()
         f.thumbnailService._export_return = "/tmp/t.jpg"
         f.thumbnailService._encode_return = "img"
@@ -324,6 +333,7 @@ describe("OllamaClient — generate()", function()
         Client = assert(loadfile(path .. "OllamaClient.lua"))()
         c = Client.new(f)
 
+        -- SDK throws propagate because we avoid wrapping yielding SDK calls in pcall.
         local ok, err = pcall(c.generate, c,
             { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
         )
@@ -395,60 +405,80 @@ describe("OllamaClient — generate()", function()
     end)
 
     --------------------------------------------------------------------
-    -- 11. Cleanup fails after successful generation → exception propagates.
-    --     Without pcall, a cleanup failure is an exception that bubbles up.
-    --     In production, LrFileUtils.delete (the cleanup implementation)
-    --     returns nil on error rather than throwing, so this is defensive.
+    -- 11. Cleanup fails after successful generation → error returned, not thrown.
     --------------------------------------------------------------------
-    it("propagates exceptions when cleanup fails after generation", function()
+    it("returns cleanup error when cleanup fails after successful generation", function()
         f = makeFakes()
         f.thumbnailService._export_return = "/tmp/t.jpg"
         f.thumbnailService._encode_return = "img"
         f.http._response = '{"response":"{\"title\":\"T\",\"caption\":\"C\",\"keywords\":[\"k\"]}"}'
         f.responseValidator._metadata = { title = "T", caption = "C", keywords = { "k" } }
-        -- Make cleanup throw.
-        f.thumbnailService.cleanup = function(_)
+        -- Make cleanup throw (but still record the call).
+        f.thumbnailService.cleanup = function(imagePath)
             table.insert(f.events, "cleanup")
+            table.insert(f.thumbnailService.cleanup_calls, imagePath)
             error("disk full")
         end
 
         Client = assert(loadfile(path .. "OllamaClient.lua"))()
         c = Client.new(f)
 
-        local ok, err = pcall(c.generate, c,
+        local result, err = c.generate(
             { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
         )
 
-        assert.is_false(ok)
+        -- pcall catches cleanup exception and returns it as error.
+        assert.is_nil(result)
+        assert.is_not_nil(string.find(tostring(err), "Failed to clean up thumbnail:", 1, true))
         assert.is_not_nil(string.find(tostring(err), "disk full", 1, true))
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        -- Validation should not have been called (cleanup failed before validation).
+        assert.are_same(0, #f.responseValidator.calls)
     end)
 
     --------------------------------------------------------------------
-    -- 12. Cleanup fails AND generation failed → first exception wins.
-    --     Without pcall, when generation throws, cleanup never runs, so
-    --     the generation error is what propagates (cleanup is never reached).
+    -- 12. Both generation AND cleanup fail → original error primary, cleanup logged.
     --------------------------------------------------------------------
-    it("propagates generation error when generation throws", function()
+    it("preserves generation error when both generation and cleanup fail", function()
         f = makeFakes()
         f.thumbnailService._export_return = "/tmp/t.jpg"
         f.thumbnailService._encode_return = "img"
-        -- POST throws (generation fails before cleanup is reached)
-        f.http.post = function(_, _, _)
-            table.insert(f.events, "post")
-            error("network timeout")
+        -- JSON encoding throws (generation fails)
+        f.json.encode = function(_)
+            table.insert(f.events, "json-encode")
+            error("json encoding failed")
+        end
+        -- Cleanup also throws (but still records the call).
+        f.thumbnailService.cleanup = function(imagePath)
+            table.insert(f.events, "cleanup")
+            table.insert(f.thumbnailService.cleanup_calls, imagePath)
+            error("disk full")
         end
 
         Client = assert(loadfile(path .. "OllamaClient.lua"))()
         c = Client.new(f)
 
-        local ok, err = pcall(c.generate, c,
+        local result, err = c.generate(
             { uuid = "p" }, "hi", nil, false, true, "gemma4:latest", nil
         )
 
-        assert.is_false(ok)
-        -- Generation error propagates; cleanup is never reached.
-        assert.is_not_nil(string.find(tostring(err), "network timeout", 1, true),
-            "Expected original generation error to propagate")
+        -- Original generation error is primary.
+        assert.is_nil(result)
+        assert.is_not_nil(string.find(tostring(err), "json encoding failed", 1, true),
+            "Expected original generation error to be returned")
+        -- Cleanup failure was logged, not surfaced as primary error.
+        assert.are_same(
+            1, #f.logger.error_calls,
+            "Cleanup failure should be logged"
+        )
+        assert.is_not_nil(
+            string.find(tostring(f.logger.error_calls[1]), "disk full", 1, true),
+            "Logged message should contain cleanup error"
+        )
+        -- Cleanup was attempted exactly once.
+        assert.are_same(1, #f.thumbnailService.cleanup_calls)
+        -- POST should not have been called (JSON encoding failed first).
+        assert.are_same(0, #f.http.post_calls)
     end)
 
     --------------------------------------------------------------------
@@ -568,6 +598,26 @@ describe("OllamaClient — generate()", function()
                 function(fake)
                     fake.thumbnailService._encode_return = "img"
                     fake.http._response = nil
+                end,
+            },
+            {
+                "prompt-throw",
+                function(fake)
+                    fake.thumbnailService._encode_return = "img"
+                    fake.promptBuilder.buildUserPrompt = function()
+                        table.insert(fake.events, "build-prompt")
+                        error("prompt builder error")
+                    end
+                end,
+            },
+            {
+                "json-throw",
+                function(fake)
+                    fake.thumbnailService._encode_return = "img"
+                    fake.json.encode = function(_)
+                        table.insert(fake.events, "json-encode")
+                        error("json encoding failed")
+                    end
                 end,
             },
         }
