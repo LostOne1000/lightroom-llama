@@ -8,9 +8,8 @@
 <p align="center">
   <a href="#key-features">Key Features</a> •
   <a href="#how-to-use">How To Use</a> •
-  <a href="#features">Features</a> •
+  <a href="#developing">Developing</a> •
   <a href="#credits">Credits</a> •
-  <a href="#related">Related</a> •
   <a href="#license">License</a>
 </p>
 
@@ -114,6 +113,34 @@ The plugin adds three menu items under **Library > Plug-in Extras** and **File >
 - **Batch Process with Llama...** - Process multiple photos
 - **Reset Metadata...** - Remove generated metadata
 
+## Developing
+
+### Running Tests
+
+The plugin includes a Busted test suite with 12 specs covering the manifest, API clients, metadata services, prompt building, and more.
+
+**Prerequisites:**
+
+- [Lua 5.1](https://www.lua.org/) (5.1.5)
+- [LuaRocks](https://luarocks.org/) — package manager for Lua
+- Busted testing framework: `luarocks install busted 2.3.0-1`
+
+**Run all tests:**
+
+```bash
+make test
+# or
+./tests/run_tests.sh
+```
+
+**Run a single spec:**
+
+```bash
+./tests/run_tests.sh tests/spec/info_spec.lua
+```
+
+Tests mock the Lightroom SDK, so no Lightroom installation is needed. See `tests/helpers/mock_sdk.lua` for the stubs.
+
 ## TODO
 
 - [x] Add support for more LLM models - queries Ollama to populate a list of models.
@@ -127,17 +154,9 @@ The plugin adds three menu items under **Library > Plug-in Extras** and **File >
 
 ## Credits
 
-- [Ollama](https://ollama.com/).
-
-## Related
-
-- [ChatGPT for Maya](https://github.com/thejoltjoker/chatgpt-for-maya) - Autodesk Maya plugin for context aware chatting with ChatGPT. Get tips, automate tasks and run code.
-
-## You may also like...
-
-- [Lightroom Power Collection](https://github.com/thejoltjoker/lightroom-power-collection) - Lightroom plugin to create a smart collection to semi-automate publishing.
-
-- [Lightroom Workflow](https://github.com/thejoltjoker/lightroom-workflow) - My Lightroom workflow and presets that I have created and use for editing, organizing and exporting my photos.
+- [Ollama](https://ollama.com/) — local LLM inference engine.
+- [Busted](https://olivinelabs.com/busted/) — Lua testing framework.
+- [thejoltjoker/lightroom-llama](https://thejoltjoker.github.io/lightroom-llama/) — original plugin this fork is based on.
 
 ## License
 
