@@ -13,6 +13,8 @@
   <a href="#license">License</a>
 </p>
 
+This is an independently maintained fork of [thejoltjoker/lightroom-llama](https://github.com/thejoltjoker/lightroom-llama), originally created by Johannes. This fork adds batch processing, metadata reset, configurable Ollama servers, and automated testing. Development will continue with additional features, improvements, and maintenance.
+
 ## Key Features
 
 - **AI-Powered Metadata Generation**: Generate titles, captions, and keywords for your photos using local AI models
@@ -156,9 +158,11 @@ Tests mock the Lightroom SDK, so no Lightroom installation is needed. See `tests
 
 - [Ollama](https://ollama.com/) — local LLM inference engine.
 - [Busted](https://olivinelabs.com/busted/) — Lua testing framework.
-- [thejoltjoker/lightroom-llama](https://thejoltjoker.github.io/lightroom-llama/) — original plugin this fork is based on.
+- [thejoltjoker/lightroom-llama](https://github.com/thejoltjoker/lightroom-llama) — original plugin this fork is based on.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+The plugin is licensed under the [MIT License](LICENSE). Bundled third-party code retains its own license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+Release archives include both notices inside the `.lrplugin` bundle. Build and verify a release with `make package VERSION=<version>`.
 

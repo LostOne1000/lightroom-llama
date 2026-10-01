@@ -97,6 +97,15 @@ This runs the full test suite, recreates `dist/`, builds `dist/lightroom-llama-v
 - For UI or entry-point changes, run automated specs and describe any Lightroom manual smoke test that still needs to be performed.
 - When architecture, commands, prerequisites, or user-visible behavior changes, update `README.md` and this file in the same change.
 
+## Licensing and attribution
+
+- Preserve upstream copyright, license, and attribution notices.
+- Keep the README's upstream attribution and independent-fork statement.
+- Document bundled third-party code and its verified license terms in `THIRD_PARTY_NOTICES.md`.
+- Include `LICENSE` and `THIRD_PARTY_NOTICES.md` in every release bundle.
+- When adding or replacing a bundled dependency, verify redistribution terms and update the notices in the same change.
+- Add copyright notices for new contributions without replacing existing authors' notices.
+
 ## Completion standard
 
 A change is complete when relevant focused tests and `make test` pass, generated files are excluded, documentation matches the implementation, and the final summary states what changed, what was tested, and any Lightroom-only verification that remains.
